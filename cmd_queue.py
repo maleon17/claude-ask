@@ -76,6 +76,8 @@ TOOL_RESULT_DIR = os.environ.get("JARVIS_TOOL_RESULT_DIR", "/tmp/jarvisask_tool_
 os.makedirs(TOOL_QUEUE_DIR, exist_ok=True)
 os.makedirs(TOOL_RESULT_DIR, exist_ok=True)
 _TOOL_QUEUE_LOCK = threading.Lock()
+TOOL_CLAIM_LEASE_S = float(os.environ.get("JARVIS_TOOL_CLAIM_LEASE_S", "45"))
+TOOL_TIMEOUT_S = float(os.environ.get("JARVIS_TOOL_TIMEOUT_S", "30"))
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SAFE_INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -127,7 +129,14 @@ def _atomic_json(path, data):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -258,7 +267,7 @@ def _persona_read(persona_dir, instance_id):
     return "", "missing"
 
 
-def _pop_pending_tool_call(instance_id: str):
+def _pop_pending_tool_call(instance_id: str, now=None):
     """Atomically claim one pending tool call for this instance -- under
     ThreadingHTTPServer, two overlapping /tool_call_pending polls (unlikely
     at this scale, but not impossible) must not both grab the same file."""
@@ -267,8 +276,9 @@ def _pop_pending_tool_call(instance_id: str):
             names = sorted(os.listdir(TOOL_QUEUE_DIR))
         except FileNotFoundError:
             return None
+        now = time.time() if now is None else now
         for name in names:
-            if not name.endswith(".json"):
+            if not (name.endswith(".json") or name.endswith(".claimed")):
                 continue
             path = os.path.join(TOOL_QUEUE_DIR, name)
             try:
@@ -278,13 +288,38 @@ def _pop_pending_tool_call(instance_id: str):
                 continue
             if data.get("instance_id") != instance_id:
                 continue
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-            data["request_id"] = name[:-5]
+            request_id = name.rsplit(".", 1)[0]
+            if data.get("cancelled") or float(data.get("expires_at", float("inf"))) <= now:
+                data["cancelled"] = True
+                data["cancel_reason"] = "expired"
+                _atomic_json(path, data)
+                continue
+            if name.endswith(".claimed") and float(data.get("lease_until", 0)) > now:
+                continue
+            claimed = os.path.join(TOOL_QUEUE_DIR, request_id + ".claimed")
+            data["lease_until"] = now + TOOL_CLAIM_LEASE_S
+            data["claimed_at"] = now
+            _atomic_json(claimed, data)
+            if path != claimed:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue
+            data["request_id"] = request_id
             return data
         return None
+
+
+def _ack_tool_result(request_id, result):
+    """Persist a result exactly once, then retire any outstanding claim."""
+    result_path = os.path.join(TOOL_RESULT_DIR, f"{request_id}.json")
+    if not os.path.exists(result_path):
+        _atomic_json(result_path, {"done": True, "request_id": request_id, "result": result})
+    for suffix in (".claimed", ".json"):
+        try:
+            os.unlink(os.path.join(TOOL_QUEUE_DIR, request_id + suffix))
+        except FileNotFoundError:
+            pass
 
 
 # Distinct from a genuine "unsure" verdict: "unsure" means the model looked
@@ -331,11 +366,10 @@ def classify_semantic(text: str, condition: str, instance_id: str, timeout: floa
         "Условие: " + condition + "\n\nСообщение: " + text[:2000]
     )
     try:
-        with open(os.path.join(ASK_QUEUE_DIR, f"{req_id}.json"), "w") as f:
-            json.dump({
+        _atomic_json(os.path.join(ASK_QUEUE_DIR, f"{req_id}.json"), {
                 "question": prompt, "chat_id": "classify", "request_id": req_id,
                 "instance_id": instance_id, "mode": "classify", "ts": time.time(), "done": False,
-            }, f)
+            })
     except Exception:
         return CLASSIFY_UNAVAILABLE
 
@@ -389,11 +423,10 @@ def classify_semantic_codex(text: str, condition: str, instance_id: str, timeout
         "Условие: " + condition + "\n\nСообщение: " + text[:2000]
     )
     try:
-        with open(os.path.join(XASK_QUEUE_DIR, f"{req_id}.json"), "w") as f:
-            json.dump({
+        _atomic_json(os.path.join(XASK_QUEUE_DIR, f"{req_id}.json"), {
                 "question": prompt, "chat_id": "classify", "instance_id": instance_id,
                 "request_id": req_id, "mode": "classify", "ts": time.time(), "done": False,
-            }, f)
+            })
     except Exception:
         return CLASSIFY_UNAVAILABLE
 
@@ -532,13 +565,11 @@ class Queue(BaseHTTPRequestHandler):
         body = self._body()
 
         if self.path == "/cmd":
-            with open(QUEUE_FILE, "w") as f:
-                json.dump({"cmd": body.get("cmd", ""), "ts": time.time()}, f)
+            _atomic_json(QUEUE_FILE, {"cmd": body.get("cmd", ""), "ts": time.time()})
             self._json({"status": "queued"})
 
         elif self.path == "/result":
-            with open(RESULT_FILE, "w") as f:
-                json.dump(body, f)
+            _atomic_json(RESULT_FILE, body)
             self._json({"status": "ok"})
 
         elif self.path in ("/ask", "/xask"):
@@ -564,13 +595,15 @@ class Queue(BaseHTTPRequestHandler):
                 if k in body:
                     ask_data[k] = body[k]
             ask_data["instance_id"] = instance_id
+            if existing:
+                self._json({"status": "accepted", "request_id": req_id})
+                return
             _record_request(request_kind, req_id, instance_id, body.get("requester_id"))
             ask_data["owner_authorized"] = _request_record(
                 request_kind, req_id
             )["owner_authorized"]
             queue_dir = XASK_QUEUE_DIR if self.path == "/xask" else ASK_QUEUE_DIR
-            with open(os.path.join(queue_dir, f"{req_id}.json"), "w") as f:
-                json.dump(ask_data, f)
+            _atomic_json(os.path.join(queue_dir, f"{req_id}.json"), ask_data)
             self._json({"status": "queued"})
 
         elif self.path == "/tool_call":
@@ -602,10 +635,17 @@ class Queue(BaseHTTPRequestHandler):
                 "requester_id": parent.get("requester_id", ""),
                 "owner_authorized": bool(parent.get("owner_authorized")),
                 "ts": time.time(),
+                "expires_at": min(
+                    float(body.get("expires_at", time.time() + TOOL_TIMEOUT_S)),
+                    time.time() + TOOL_TIMEOUT_S,
+                ),
             }
+            existing = _request_record("tool", req_id)
+            if existing:
+                self._json({"status": "accepted", "request_id": req_id})
+                return
             _record_request("tool", req_id, instance_id, parent.get("requester_id"))
-            with open(os.path.join(TOOL_QUEUE_DIR, f"{req_id}.json"), "w") as f:
-                json.dump(call_data, f)
+            _atomic_json(os.path.join(TOOL_QUEUE_DIR, f"{req_id}.json"), call_data)
             self._json({"status": "queued"})
 
         elif self.path == "/tool_call_result":
@@ -615,8 +655,7 @@ class Queue(BaseHTTPRequestHandler):
                 return
             if not self._owns_request("tool", req_id, instance_id):
                 return
-            with open(os.path.join(TOOL_RESULT_DIR, f"{req_id}.json"), "w") as f:
-                json.dump({"done": True, "result": body.get("result", "")}, f)
+            _ack_tool_result(req_id, body.get("result", ""))
             self._json({"status": "ok"})
 
         elif self.path == "/ocr":
@@ -648,8 +687,7 @@ class Queue(BaseHTTPRequestHandler):
                 self._json({"status": "error", "message": "Некорректные chat_id или instance_id"})
                 return
             reset_id = f"reset_{uuid.uuid4().hex}"
-            with open(os.path.join(XASK_RESET_DIR, reset_id + ".json"), "w") as f:
-                json.dump({"chat_id": str(chat_id), "instance_id": instance_id}, f)
+            _atomic_json(os.path.join(XASK_RESET_DIR, reset_id + ".json"), {"chat_id": str(chat_id), "instance_id": instance_id})
             self._json({"status": "ok", "message": f"Codex-сессия чата {chat_id} будет сброшена"})
 
         elif self.path in ("/persona", "/xpersona"):

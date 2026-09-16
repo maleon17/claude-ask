@@ -60,6 +60,7 @@ import re
 import subprocess
 import threading
 import time
+import queue
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -109,7 +110,7 @@ CHAT_REQUEST_LOCKS_LOCK = threading.Lock()
 # claude_ask.py, doesn't send one yet) keeps using the ORIGINAL filename
 # unchanged, so none of the owner's already-accumulated sessions move or
 # need migrating. Any other instance_id gets its own fresh, separate file.
-_SESSIONS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SESSIONS_DIR = os.environ.get("JARVIS_ASK_DIR", os.path.dirname(os.path.abspath(__file__)))
 SESSIONS_FILE = os.path.join(_SESSIONS_DIR, "ask_sessions.json")  # old plaintext path, only for one-time migration below
 DEFAULT_INSTANCE = "andrey"
 
@@ -690,6 +691,30 @@ def call_llm(
 # a burst of requests would just thrash the box. 5 is generous for a
 # personal/small-group bot; raise if it ever actually gets hit.
 _CONCURRENCY = threading.Semaphore(5)
+WORKER_QUEUE_MAX = int(os.environ.get("CLAUDE_JARVIS_WORKER_QUEUE_MAX", "64"))
+WORKER_CONCURRENCY = int(os.environ.get("CLAUDE_JARVIS_WORKER_CONCURRENCY", "5"))
+
+
+def _atomic_json(path, data):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = os.path.join(directory, f".tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def _process_request(
@@ -706,18 +731,11 @@ def _process_request(
                 exclude_id=exclude_id, requester_id=requester_id, owner_authorized=owner_authorized,
             )
             print(f"  A: {answer[:80]}...", flush=True)
-            with open(result_path, "w") as f:
-                json.dump(
-                    {"done": True, "request_id": req_id, "answer": answer, "thoughts": thoughts}, f,
-                )
+            _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": answer, "thoughts": thoughts})
         except Exception as e:
             print(f"ERR [{req_id}]: {e}", flush=True)
             try:
-                with open(result_path, "w") as f:
-                    json.dump(
-                        {"done": True, "request_id": req_id, "answer": f"Ошибка воркера: {e}", "thoughts": []},
-                        f,
-                    )
+                _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": f"Ошибка воркера: {e}", "thoughts": []})
             except Exception:
                 pass
 
@@ -740,6 +758,52 @@ def _process_request_serialized(
 
 def main():
     print("CLAUDE ASK WATCHER READY (streaming, concurrent)", flush=True)
+    pending = queue.Queue(maxsize=WORKER_QUEUE_MAX)
+    admitted = set()
+    admitted_lock = threading.Lock()
+
+    def consume():
+        while True:
+            processing = pending.get()
+            try:
+                with open(processing) as f:
+                    data = json.load(f)
+                req_id = data.get("request_id", os.path.basename(processing).split(".json", 1)[0])
+                if data.get("question"):
+                    _process_request_serialized(
+                        req_id, data["question"], data.get("chat_id", "unknown"), data.get("mode", "chat"),
+                        data.get("instance_id") or DEFAULT_INSTANCE, data.get("topic_id"), data.get("message_id"),
+                        data.get("requester_id"), data.get("owner_authorized", False),
+                    )
+            except Exception as exc:
+                req_id = os.path.basename(processing).split(".json", 1)[0]
+                _atomic_json(os.path.join(RESULT_DIR, f"{req_id}.json"), {
+                    "done": True, "request_id": req_id, "answer": f"Ошибка очереди: {exc}", "thoughts": [],
+                })
+            finally:
+                try:
+                    os.unlink(processing)
+                except FileNotFoundError:
+                    pass
+                with admitted_lock:
+                    admitted.discard(processing)
+                pending.task_done()
+
+    for _ in range(WORKER_CONCURRENCY):
+        threading.Thread(target=consume, daemon=True).start()
+    # An item already claimed by a prior process may have run an external
+    # action. Do not replay it; make recovery visible to its poller.
+    for fname in os.listdir(QUEUE_DIR):
+        if fname.endswith(".json.processing"):
+            req_id = fname.split(".json.processing", 1)[0]
+            _atomic_json(os.path.join(RESULT_DIR, f"{req_id}.json"), {
+                "done": True, "request_id": req_id,
+                "answer": "Запрос прерван перезапуском worker; действие не повторялось.", "thoughts": [],
+            })
+            try:
+                os.unlink(os.path.join(QUEUE_DIR, fname))
+            except FileNotFoundError:
+                pass
     while True:
         try:
             for fname in os.listdir(QUEUE_DIR):
@@ -751,38 +815,21 @@ def main():
                         data = json.load(f)
                 except Exception:
                     continue
+                processing = path + ".processing"
                 try:
-                    os.remove(path)
+                    os.replace(path, processing)
                 except FileNotFoundError:
                     continue
-                if not isinstance(data, dict) or not data.get("question"):
-                    continue
-                req_id = data.get("request_id", fname[:-5])
-                question = data.get("question", "")
-                chat_id = data.get("chat_id", "unknown")
-                mode = data.get("mode", "chat")
-                # Missing instance_id (today's only deployed client,
-                # claude_ask.py, doesn't send one) defaults to the existing
-                # owner instance -- zero behavior change for it.
-                instance_id = data.get("instance_id") or DEFAULT_INSTANCE
-                # topic_id/message_id (see cmd_queue.py's /ask handler,
-                # already forwarded these two keys) -- message_id here is
-                # the live work_message's id from the ORIGINAL .ask, used as
-                # exclude_id so a real MCP read_history/search_chat tool
-                # call doesn't sweep up the bot's own live "🤔 Думаю"
-                # placeholder as if it were part of the conversation.
-                topic_id = data.get("topic_id")
-                exclude_id = data.get("message_id")
-                requester_id = data.get("requester_id")
-                threading.Thread(
-                    target=_process_request_serialized,
-                    args=(req_id, question, chat_id, mode, instance_id),
-                    kwargs={
-                        "topic_id": topic_id, "exclude_id": exclude_id,
-                        "requester_id": requester_id,
-                    },
-                    daemon=True,
-                ).start()
+                with admitted_lock:
+                    if processing in admitted:
+                        continue
+                    try:
+                        pending.put_nowait(processing)
+                        admitted.add(processing)
+                    except queue.Full:
+                        # Put it back for a later FIFO admission instead of
+                        # accumulating a daemon thread per request.
+                        os.replace(processing, path)
             time.sleep(1)
         except Exception as e:
             print(f"ERR: {e}", flush=True)
