@@ -28,7 +28,7 @@
 #
 # GPL AGPLv3
 
-import asyncio, html, json, os, re, shutil, subprocess, tempfile, time, urllib.request, urllib.parse, uuid
+import asyncio, html, json, os, re, secrets, shutil, subprocess, tempfile, time, urllib.request, urllib.parse, uuid
 from datetime import datetime, timezone
 
 from herokutl.tl.functions.channels import ToggleForumRequest, InviteToChannelRequest, GetParticipantRequest
@@ -63,6 +63,7 @@ if HTTP_PROXY:
 # Explicit now (was implicit -- claude_watcher.py defaulted a missing
 # instance_id to "andrey").
 INSTANCE_ID = os.environ.get("CLAUDE_JARVIS_INSTANCE_ID", "andrey")
+RELAY_TOKEN = os.environ.get("CLAUDE_JARVIS_RELAY_TOKEN", "")
 ENGINE = "claude"
 MAX_ROUNDS = 5  # mirrors claude_watcher.py's own round discipline
 POLL_TIMEOUT_S = 600  # agentic file-editing tasks can genuinely take a while
@@ -78,6 +79,28 @@ EDIT_TRIGGER_IDLE_SECONDS = 10
 # deliberate, informed risk the owner chose to take after that history, not
 # an oversight. Groups keep the static "🤔 Thinking" placeholder unchanged.
 THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
+
+
+def _relay_headers(content_type=None):
+    headers = {"Authorization": f"Bearer {RELAY_TOKEN}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _multipart_file_body(data, filename):
+    # The body may be arbitrary bytes, so regenerate on the astronomically
+    # unlikely collision rather than assuming a random boundary is absent.
+    while True:
+        boundary = secrets.token_hex(24)
+        if boundary.encode() not in data and boundary not in filename:
+            break
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    return boundary, body
 
 # Telegram-side effects and persistent trigger changes are never accepted
 # from an arbitrary queued request. Default-deny: only tools explicitly
@@ -271,7 +294,7 @@ class ClaudeAsk(loader.Module):
     # -- Forum topics (Phase 1 infra) -----------------------------------------
 
     async def client_ready(self):
-        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID
+        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN
 
         self._topics = {}
         self._owner_id_cache = None
@@ -301,6 +324,7 @@ class ClaudeAsk(loader.Module):
             BACKEND_URL = network.get("backend_url", BACKEND_URL)
             HTTP_PROXY = network.get("http_proxy", HTTP_PROXY)
             INSTANCE_ID = network.get("instance_id", INSTANCE_ID)
+            RELAY_TOKEN = network.get("relay_token", RELAY_TOKEN)
             if HTTP_PROXY:
                 urllib.request.install_opener(
                     urllib.request.build_opener(
@@ -398,7 +422,7 @@ class ClaudeAsk(loader.Module):
             if isinstance(tool, str) and tool.strip()
         )
 
-    async def _tool_request_is_authorized(self, requester_id, chat_id, tool=None, args=None):
+    async def _tool_request_is_authorized(self, requester_id, chat_id, tool=None, args=None, owner_authorized=None):
         requester = str(requester_id or "").strip()
         args = args if isinstance(args, dict) else {}
 
@@ -425,10 +449,18 @@ class ClaudeAsk(loader.Module):
                 return self._trigger_target_is_current_chat(args.get("target"), chat_id, topic_id)
             return True
 
+        # Live tool calls carry this value from the relay's request manifest;
+        # it is computed there from the authenticated instance's configured
+        # owner id, never from a caller-supplied JSON privilege flag.  Keep
+        # ``None`` for direct legacy/unit callers during the rolling update.
+        if owner_authorized is not None:
+            if owner_authorized is True:
+                return True
+
         try:
             owner_id = await self._get_owner_id()
             chat = str(chat_id).strip()
-            if owner_id is not None and requester == str(owner_id):
+            if owner_authorized is None and owner_id is not None and requester == str(owner_id):
                 return True
             # read_history/search_chat remain public for non-owner requesters,
             # but only against the chat that owns this request. Other public
@@ -439,7 +471,10 @@ class ClaudeAsk(loader.Module):
                 if tool in HISTORY_TOOLS:
                     return self._chat_arg_is_current(args.get("chat"), chat_id)
                 return True
-            return owner_id is not None and requester == str(TEST_CHANNEL_BOT_ID) and chat == str(owner_id)
+            return (
+                owner_authorized is None and owner_id is not None
+                and requester == str(TEST_CHANNEL_BOT_ID) and chat == str(owner_id)
+            )
         except Exception:
             return False
 
@@ -684,18 +719,13 @@ class ClaudeAsk(loader.Module):
         directly. This is the same upload mechanism DOWNLOAD_REPLY used to
         use -- just called eagerly, before asking, instead of as a marker
         round-trip mid-conversation."""
-        boundary = uuid.uuid4().hex
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-            f"Content-Type: application/octet-stream\r\n\r\n"
-        ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        boundary, body = _multipart_file_body(data, filename)
         loop = asyncio.get_running_loop()
 
         def upload():
             req = urllib.request.Request(
                 f"{BACKEND_URL}/upload", data=body,
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                headers=_relay_headers(f"multipart/form-data; boundary={boundary}"),
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=60) as r:
@@ -1109,7 +1139,7 @@ class ClaudeAsk(loader.Module):
             urllib.request.urlopen(
                 urllib.request.Request(
                     f"{BACKEND_URL}/ask", data=data,
-                    headers={"Content-Type": "application/json"}, method="POST",
+                    headers=_relay_headers("application/json"), method="POST",
                 ),
                 timeout=5,
             )
@@ -1126,7 +1156,7 @@ class ClaudeAsk(loader.Module):
         host, no funnel) while this side has to poll for work instead of
         being pushed to."""
         qs = urllib.parse.urlencode({"instance_id": INSTANCE_ID})
-        req = urllib.request.Request(f"{BACKEND_URL}/tool_call_pending?{qs}")
+        req = urllib.request.Request(f"{BACKEND_URL}/tool_call_pending?{qs}", headers=_relay_headers())
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read())
 
@@ -1135,7 +1165,7 @@ class ClaudeAsk(loader.Module):
         urllib.request.urlopen(
             urllib.request.Request(
                 f"{BACKEND_URL}/tool_call_result", data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
+                headers=_relay_headers("application/json"), method="POST",
             ),
             timeout=5,
         )
@@ -1145,7 +1175,7 @@ class ClaudeAsk(loader.Module):
         # chat), each with its own result file keyed by request_id -- the
         # relay needs to know which one to fetch.
         qs = urllib.parse.urlencode({"request_id": req_id})
-        req = urllib.request.Request(f"{BACKEND_URL}/ask?{qs}")
+        req = urllib.request.Request(f"{BACKEND_URL}/ask?{qs}", headers=_relay_headers())
         with urllib.request.urlopen(req, timeout=3) as r:
             return json.loads(r.read())
 
@@ -1269,7 +1299,8 @@ class ClaudeAsk(loader.Module):
 
             def fetch():
                 req = urllib.request.Request(
-                    f"{BACKEND_URL}/download?path={urllib.parse.quote(path)}"
+                    f"{BACKEND_URL}/download?path={urllib.parse.quote(path)}",
+                    headers=_relay_headers(),
                 )
                 with urllib.request.urlopen(req, timeout=60) as r:
                     return r.read()
@@ -2254,14 +2285,26 @@ class ClaudeAsk(loader.Module):
         if not items:
             return "Активных триггеров нет."
         lines = []
+        # _chat_label() is a real get_entity() network round-trip. Without
+        # this cache it ran once PER TRIGGER, not per chat -- for "this
+        # chat" every item shares the same cid, so 45 triggers meant 45
+        # sequential round-trips and blew straight through the MCP
+        # relay's 30s timeout (caught live 2026-09-16, Paша: list_triggers
+        # never returned even scoped to one chat). Same cid within one
+        # call now resolves once.
+        label_cache = {}
         for cid, t in items:
             # cid comes straight from a stored dict key here (not from a
             # freshly resolved entity id) -- a malformed/empty key must
             # still be listed, not crash the whole call.
             try:
-                chat_label = await self._chat_label(int(cid))
+                cid_int = int(cid)
             except (ValueError, TypeError):
                 chat_label = f"НЕИЗВЕСТНЫЙ ЧАТ (битый ключ {cid!r})"
+            else:
+                if cid_int not in label_cache:
+                    label_cache[cid_int] = await self._chat_label(cid_int)
+                chat_label = label_cache[cid_int]
             line = f"- id={t['id']}, [{t.get('engine', 'claude')}] чат «{chat_label}», {t['kind']} → {t['action']}: {t.get('label', '')}"
             if t.get("action") == "agent":
                 line += f"\n  отчёт: {t.get('report_to', 'origin')}"
@@ -2390,10 +2433,10 @@ class ClaudeAsk(loader.Module):
         loop = asyncio.get_running_loop()
 
         def call():
-            data = json.dumps({"text": text[:2000], "condition": condition}).encode()
+            data = json.dumps({"text": text[:2000], "condition": condition, "instance_id": INSTANCE_ID}).encode()
             req = urllib.request.Request(
                 f"{BACKEND_URL}/classify", data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
+                headers=_relay_headers("application/json"), method="POST",
             )
             with urllib.request.urlopen(req, timeout=15) as r:
                 return json.loads(r.read())
@@ -3340,7 +3383,10 @@ class ClaudeAsk(loader.Module):
         chat_id = data.get("chat_id") or ""
         requester_id = data.get("requester_id")
         try:
-            if not await self._tool_request_is_authorized(requester_id, chat_id, tool=tool, args=args):
+            if not await self._tool_request_is_authorized(
+                requester_id, chat_id, tool=tool, args=args,
+                owner_authorized=data.get("owner_authorized"),
+            ):
                 result = TOOL_PERMISSION_DENIAL
             elif tool == "resolve_person":
                 result = await self._resolve_person(args.get("query", ""))
@@ -3761,7 +3807,7 @@ class ClaudeAsk(loader.Module):
     @loader.command()
     async def asknet(self, message):
         """Настроить instance_id, backend URL и HTTP proxy"""
-        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID
+        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN
 
         work_message = await self._work_message(message)
 
@@ -3772,14 +3818,27 @@ class ClaudeAsk(loader.Module):
                 "<code>.asknet local &lt;instance_id&gt;</code>\n"
                 "<code>.asknet tailnet &lt;instance_id&gt; &lt;backend_url&gt;</code>\n"
                 "<code>.asknet custom &lt;instance_id&gt; &lt;backend_url&gt; &lt;proxy_url|none&gt;</code>\n\n"
+                "<code>.asknet token &lt;token&gt;</code>\n\n"
                 f"instance_id: <code>{_h(INSTANCE_ID)}</code>\n"
                 f"backend_url: <code>{_h(BACKEND_URL)}</code>\n"
-                f"http_proxy: <code>{_h(proxy)}</code>"
+                f"http_proxy: <code>{_h(proxy)}</code>\n"
+                f"relay_token: <code>{'configured' if RELAY_TOKEN else 'not configured'}</code>"
             )
 
         args = utils.get_args_raw(message).split()
         if not args:
             await self._safe_edit(work_message, usage(), parse_mode="html")
+            return
+
+        if args[0].lower() == "token" and len(args) == 2:
+            RELAY_TOKEN = args[1]
+            self.db.set("ClaudeAsk", "network", {
+                "instance_id": INSTANCE_ID,
+                "backend_url": BACKEND_URL,
+                "http_proxy": HTTP_PROXY,
+                "relay_token": RELAY_TOKEN,
+            })
+            await self._safe_edit(work_message, "✅ Relay token сохранён (значение скрыто).", parse_mode="html")
             return
 
         mode = args[0].lower()
@@ -3810,6 +3869,7 @@ class ClaudeAsk(loader.Module):
             "instance_id": INSTANCE_ID,
             "backend_url": BACKEND_URL,
             "http_proxy": HTTP_PROXY,
+            "relay_token": RELAY_TOKEN,
         })
         if HTTP_PROXY:
             urllib.request.install_opener(
@@ -3899,7 +3959,7 @@ class ClaudeAsk(loader.Module):
             def do_reset():
                 req = urllib.request.Request(
                     f"{BACKEND_URL}/reset", data=data,
-                    headers={"Content-Type": "application/json"}, method="POST",
+                    headers=_relay_headers("application/json"), method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=5) as r:
                     return json.loads(r.read())
@@ -3912,7 +3972,7 @@ class ClaudeAsk(loader.Module):
     def _persona_http(self, method, path, payload=None):
         # Blocking; call via run_in_executor. Mirrors .new's do_reset pattern.
         data = json.dumps(payload).encode() if payload is not None else None
-        headers = {"Content-Type": "application/json"} if data else {}
+        headers = _relay_headers("application/json") if data else _relay_headers()
         req = urllib.request.Request(f"{BACKEND_URL}{path}", data=data, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())

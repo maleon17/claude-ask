@@ -434,6 +434,7 @@ def run_claude_streaming(
     config_dir: str = None, model: str = None,
     mcp_config: str = None, chat_id: str = None, instance_id: str = None,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
+    request_id: str = None,
 ):
     """Streams a single `claude -p` turn, calling on_progress(html_text) as
     thoughts/tool calls/results come in. Returns (final_text, thought_history,
@@ -486,6 +487,7 @@ def run_claude_streaming(
             env["CHAT_ID"] = str(chat_id or "")
             env["INSTANCE_ID"] = str(instance_id or DEFAULT_INSTANCE)
             env["REQUESTER_ID"] = str(requester_id or "")
+            env["JARVIS_RELAY_REQUEST_ID"] = str(request_id or "")
             if topic_id:
                 env["TOPIC_ID"] = str(topic_id)
             if exclude_id:
@@ -643,6 +645,7 @@ def run_claude_streaming(
 def call_llm(
     question: str, chat_id: str, mode: str, req_id: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
+    owner_authorized: bool = False,
 ):
     if mode == "chat":
         system = load_persona(instance_id)
@@ -674,7 +677,7 @@ def call_llm(
     answer, thoughts, new_session_id = run_claude_streaming(
         system, question, on_progress, session_id=session_id, config_dir=_config_dir(instance_id), model=model,
         mcp_config=mcp_config, chat_id=chat_id, instance_id=instance_id,
-        topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id,
+        topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id, request_id=req_id,
     )
 
     if mode == "chat" and new_session_id:
@@ -692,6 +695,7 @@ _CONCURRENCY = threading.Semaphore(5)
 def _process_request(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
+    owner_authorized: bool = False,
 ):
     result_path = os.path.join(RESULT_DIR, f"{req_id}.json")
     with _CONCURRENCY:
@@ -699,7 +703,7 @@ def _process_request(
             print(f"[{instance_id}:{chat_id}:{mode}] Q: {question[:80]}...", flush=True)
             answer, thoughts = call_llm(
                 question, chat_id, mode, req_id, instance_id, topic_id=topic_id,
-                exclude_id=exclude_id, requester_id=requester_id,
+                exclude_id=exclude_id, requester_id=requester_id, owner_authorized=owner_authorized,
             )
             print(f"  A: {answer[:80]}...", flush=True)
             with open(result_path, "w") as f:
@@ -721,15 +725,16 @@ def _process_request(
 def _process_request_serialized(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
+    owner_authorized: bool = False,
 ):
     # Stateless utility modes share no resumable session and stay parallel.
     if mode != "chat":
         return _process_request(
-            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
+            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized,
         )
     with _chat_request_lock(instance_id, chat_id):
         return _process_request(
-            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
+            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized,
         )
 
 

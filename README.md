@@ -65,7 +65,7 @@ be installed once per host.
 
 Send the same `claude_ask.py` as a document to each userbot instance's
 dedicated test Telegram channel and reply to the document with `.lm`. Then,
-once per account, run `.asknet local <instance_id>` or
+once per account, run `.asknet token <token>` and `.asknet local <instance_id>` or
 `.asknet tailnet <instance_id> <backend_url>`. Settings persist across later
 updates via `.dlm`. After loading, verify `.ask`, `.new`, and a request that
 uses a real tool (`list_triggers`, `read_history`, or `search_chat`).
@@ -74,6 +74,32 @@ The queue relay's network address and the Mistral key for voice
 transcription are set via environment variables
 (`CLAUDE_JARVIS_BACKEND_URL`, `MISTRAL_API_KEY`); no secrets are stored in
 the repository.
+
+## Relay authentication
+
+The relay refuses to start unless `JARVIS_RELAY_TOKENS_FILE` contains a
+non-empty JSON map of `sha256(token)` to `instance_id`, and
+`JARVIS_RELAY_OWNERS_FILE` contains the corresponding server-side map of
+`instance_id` to Telegram owner ID. Store both files outside the checkout,
+mode `0600`. Generate an entry (the raw token is printed once only):
+
+```bash
+JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json \
+  python3 cmd_queue.py --add-token <instance_id>
+```
+
+Set `JARVIS_RELAY_BIND` to a comma-separated list of listen addresses; its
+safe default is `127.0.0.1`. Set `JARVIS_RELAY_TOKEN` for a one-instance
+local watcher/MCP or `JARVIS_RELAY_TOKENS_JSON` as a JSON instance-to-token
+map when one watcher serves several instances. Remote userbots save their own token with
+`.asknet token <token>`; the command only reports that it is configured.
+
+The authenticated userbot reports `requester_id`; relay cannot independently
+verify the original Telegram sender. This is the explicit trust boundary.
+The relay nevertheless derives owner authorization on the server by comparing
+that value with the owner ID configured for the token's instance, and never
+accepts a client-provided owner flag. Requests, tool calls, results, personas,
+resets and registered download artifacts are all scoped to that instance.
 
 ## Verification and updates
 

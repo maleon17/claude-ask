@@ -6,7 +6,12 @@ import os
 import re
 import time
 import base64
+import hashlib
+import hmac
+import secrets
 import socketserver
+import sys
+import tempfile
 import threading
 import urllib.request
 import urllib.parse
@@ -74,6 +79,110 @@ _TOOL_QUEUE_LOCK = threading.Lock()
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SAFE_INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+# Authentication is intentionally loaded only by the relay entry point.  The
+# module is also imported by isolated tests, which provide these maps directly.
+# The token file contains only {sha256(token): instance_id}; a bearer token is
+# never written to this repository or to a queue item.
+RELAY_TOKENS = {}
+RELAY_OWNER_IDS = {}
+RELAY_STATE_DIR = os.environ.get("JARVIS_RELAY_STATE_DIR", "/tmp/jarvisask_relay_state")
+ARTIFACT_DIR = os.environ.get("JARVIS_RELAY_ARTIFACT_DIR", "/tmp/jarvisask_artifacts")
+
+
+def _load_mapping(path, label):
+    if not path:
+        raise RuntimeError(f"{label}: не задан путь к файлу")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{label}: не удалось прочитать {path}: {exc}") from exc
+    if not isinstance(data, dict) or not data:
+        raise RuntimeError(f"{label}: файл {path} пуст или имеет неверный JSON-формат")
+    return data
+
+
+def _load_relay_config():
+    global RELAY_TOKENS, RELAY_OWNER_IDS
+    tokens = _load_mapping(os.environ.get("JARVIS_RELAY_TOKENS_FILE"), "JARVIS_RELAY_TOKENS_FILE")
+    owners = _load_mapping(os.environ.get("JARVIS_RELAY_OWNERS_FILE"), "JARVIS_RELAY_OWNERS_FILE")
+    checked_tokens = {}
+    for digest, instance_id in tokens.items():
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError("JARVIS_RELAY_TOKENS_FILE: ключи должны быть sha256(token) в hex")
+        if not _safe_instance_id(instance_id):
+            raise RuntimeError("JARVIS_RELAY_TOKENS_FILE: неверный instance_id")
+        if instance_id not in owners or not str(owners[instance_id]).strip():
+            raise RuntimeError(f"JARVIS_RELAY_OWNERS_FILE: нет owner id для instance {instance_id!r}")
+        checked_tokens[digest] = instance_id
+    RELAY_TOKENS = checked_tokens
+    RELAY_OWNER_IDS = {str(key): str(value) for key, value in owners.items()}
+
+
+def _atomic_json(path, data):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _manifest_path(kind, request_id):
+    return os.path.join(RELAY_STATE_DIR, "requests", kind, request_id + ".json")
+
+
+def _record_request(kind, request_id, instance_id, requester_id=None):
+    _atomic_json(_manifest_path(kind, request_id), {
+        "instance_id": instance_id,
+        "requester_id": "" if requester_id is None else str(requester_id),
+        # This is deliberately server-derived.  JSON flags from a client are
+        # ignored; the userbot remains the trusted source of requester_id.
+        "owner_authorized": hmac.compare_digest(
+            "" if requester_id is None else str(requester_id),
+            str(RELAY_OWNER_IDS.get(instance_id, "")),
+        ),
+    })
+
+
+def _request_record(kind, request_id):
+    try:
+        with open(_manifest_path(kind, request_id), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _artifact_path(instance_id, path):
+    key = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()
+    return os.path.join(RELAY_STATE_DIR, "artifacts", instance_id, key + ".json")
+
+
+def _register_artifact(instance_id, path):
+    resolved = os.path.realpath(path)
+    if not os.path.isabs(resolved) or not os.path.isfile(resolved):
+        return False
+    _atomic_json(_artifact_path(instance_id, resolved), {"path": resolved})
+    return True
+
+
+def _artifact_registered(instance_id, path):
+    resolved = os.path.realpath(path)
+    try:
+        with open(_artifact_path(instance_id, resolved), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return False
+    return isinstance(record, dict) and hmac.compare_digest(str(record.get("path", "")), resolved)
 
 
 def _safe_request_id(value):
@@ -190,7 +299,7 @@ def _pop_pending_tool_call(instance_id: str):
 CLASSIFY_UNAVAILABLE = "__unavailable__"
 
 
-def classify_semantic(text: str, condition: str, timeout: float = 25.0) -> str:
+def classify_semantic(text: str, condition: str, instance_id: str, timeout: float = 25.0) -> str:
     """Tier 1 trigger classifier (Phase 4): a cheap 3-way call ("yes"/"no"/
     "unsure") for conditions that don't reduce to a keyword/link/button
     check. Returns "unsure", not just "no", on genuine ambiguity -- that's
@@ -225,7 +334,7 @@ def classify_semantic(text: str, condition: str, timeout: float = 25.0) -> str:
         with open(os.path.join(ASK_QUEUE_DIR, f"{req_id}.json"), "w") as f:
             json.dump({
                 "question": prompt, "chat_id": "classify", "request_id": req_id,
-                "mode": "classify", "ts": time.time(), "done": False,
+                "instance_id": instance_id, "mode": "classify", "ts": time.time(), "done": False,
             }, f)
     except Exception:
         return CLASSIFY_UNAVAILABLE
@@ -259,7 +368,7 @@ def classify_semantic(text: str, condition: str, timeout: float = 25.0) -> str:
     return CLASSIFY_UNAVAILABLE
 
 
-def classify_semantic_codex(text: str, condition: str, timeout: float = 25.0) -> str:
+def classify_semantic_codex(text: str, condition: str, instance_id: str, timeout: float = 25.0) -> str:
     """Codex-side sibling of classify_semantic above -- same Tier 1 trigger
     classifier contract (3-way yes/no/unsure), same reasoning for why it's
     routed through the flat-subscription queue instead of a metered API
@@ -282,7 +391,7 @@ def classify_semantic_codex(text: str, condition: str, timeout: float = 25.0) ->
     try:
         with open(os.path.join(XASK_QUEUE_DIR, f"{req_id}.json"), "w") as f:
             json.dump({
-                "question": prompt, "chat_id": "classify", "instance_id": "andrey_codex",
+                "question": prompt, "chat_id": "classify", "instance_id": instance_id,
                 "request_id": req_id, "mode": "classify", "ts": time.time(), "done": False,
             }, f)
     except Exception:
@@ -343,13 +452,48 @@ def ocr_image(b64: str, question: str = "Извлеки весь текст с �
         return f"OCR error: {e}"
 
 
+def _multipart_file_part(content_type, raw):
+    """Return one multipart part's headers and exact payload bytes.
+
+    A multipart delimiter is a complete line, not every occurrence of a
+    boundary-looking byte sequence.  In particular, a CRLFCRLF in a file is
+    data, and the closing CRLF after a file is optional after ``--boundary--``.
+    """
+    match = re.search(r"(?:^|;)\s*boundary=(?:\"([^\"]+)\"|([^;\s]+))", content_type, re.I)
+    boundary = (match.group(1) or match.group(2)).encode("ascii") if match else b""
+    if not boundary or b"\r" in boundary or b"\n" in boundary:
+        raise ValueError("Некорректный multipart boundary")
+    delimiter = b"--" + boundary
+    prefix = delimiter + b"\r\n"
+    if not raw.startswith(prefix):
+        raise ValueError("Некорректное multipart тело")
+    header_start = len(prefix)
+    header_end = raw.find(b"\r\n\r\n", header_start)
+    if header_end < 0:
+        raise ValueError("В multipart нет заголовков файла")
+    cursor = header_end + 4
+    marker = b"\r\n" + delimiter
+    while True:
+        end = raw.find(marker, cursor)
+        if end < 0:
+            raise ValueError("В multipart нет завершающего boundary")
+        suffix = raw[end + len(marker):]
+        if suffix.startswith(b"--") or suffix.startswith(b"\r\n"):
+            return raw[header_start:header_end], raw[cursor:end]
+        # A boundary-like sequence inside a file is data unless it ends a
+        # delimiter line.  Continue after its leading CRLF without copying.
+        cursor = end + 2
+
+
 class Queue(BaseHTTPRequestHandler):
     def do_POST(self):
+        instance_id = self._authenticate()
+        if instance_id is None:
+            return
         if self.path == "/upload":
             content_type = self.headers.get("Content-Type", "")
-            if "multipart" not in content_type:
-                self.send_response(400)
-                self.end_headers()
+            if "multipart/form-data" not in content_type.lower():
+                self._error(400, "Ожидался multipart/form-data")
                 return
             try:
                 content_length = int(self.headers.get("Content-Length", 0))
@@ -360,8 +504,12 @@ class Queue(BaseHTTPRequestHandler):
                 self._json({"status": "error", "message": "Файл слишком большой"})
                 return
             body_raw = self.rfile.read(content_length)
-            # Find filename in Content-Disposition
-            fname_match = re.search(rb'filename="([^"]+)"', body_raw)
+            try:
+                headers_raw, file_data = _multipart_file_part(content_type, body_raw)
+            except ValueError as exc:
+                self._error(400, str(exc))
+                return
+            fname_match = re.search(rb'(?:^|;)\s*filename="([^"]*)"', headers_raw, re.I)
             raw_fname = fname_match.group(1).decode("utf-8", "replace") if fname_match else "uploaded_file"
             normalized_fname = raw_fname.replace("\\", "/")
             fname = os.path.basename(normalized_fname)
@@ -372,20 +520,12 @@ class Queue(BaseHTTPRequestHandler):
                 self._json({"status": "error", "message": "Некорректное имя файла"})
                 return
             fname = fname[:180]
-            # Find the binary part (after \r\n\r\n after the Content-Type line)
-            parts = body_raw.split(b"\r\n\r\n", 2)
-            if len(parts) >= 3:
-                file_data = parts[2].rsplit(b"\r\n--", 1)[0]
-            elif len(parts) >= 2:
-                file_data = parts[1].rsplit(b"\r\n--", 1)[0]
-            else:
-                file_data = b""
-            # Do not let a client overwrite a predictable /tmp file (or a
-            # file uploaded by another request).  The returned path is the
-            # only name downstream needs for the subsequent /download call.
-            save_path = os.path.join("/tmp", f"jarvis_upload_{uuid.uuid4().hex}_{fname}")
+            outbox = os.path.join(ARTIFACT_DIR, instance_id, "uploads")
+            os.makedirs(outbox, exist_ok=True)
+            save_path = os.path.join(outbox, f"{uuid.uuid4().hex}_{fname}")
             with open(save_path, "wb") as f:
                 f.write(file_data)
+            _register_artifact(instance_id, save_path)
             self._json({"status": "ok", "path": save_path, "filename": fname})
             return
 
@@ -402,9 +542,16 @@ class Queue(BaseHTTPRequestHandler):
             self._json({"status": "ok"})
 
         elif self.path in ("/ask", "/xask"):
+            if not self._body_instance_is_current(body, instance_id):
+                return
             req_id = body.get("request_id", "")
             if not _safe_request_id(req_id):
                 self._json({"status": "error", "message": "Некорректный request_id"})
+                return
+            request_kind = "xask" if self.path == "/xask" else "ask"
+            existing = _request_record(request_kind, req_id)
+            if existing and not hmac.compare_digest(str(existing.get("instance_id", "")), instance_id):
+                self._error(403, "request_id уже принадлежит другому instance")
                 return
             ask_data = {
                 "question": body.get("question", ""),
@@ -412,29 +559,51 @@ class Queue(BaseHTTPRequestHandler):
                 "done": False,
             }
             for k in (
-                "chat_id", "request_id", "message_id", "topic_id", "mode",
-                "instance_id", "requester_id",
+                "chat_id", "request_id", "message_id", "topic_id", "mode", "requester_id",
             ):
                 if k in body:
                     ask_data[k] = body[k]
+            ask_data["instance_id"] = instance_id
+            _record_request(request_kind, req_id, instance_id, body.get("requester_id"))
+            ask_data["owner_authorized"] = _request_record(
+                request_kind, req_id
+            )["owner_authorized"]
             queue_dir = XASK_QUEUE_DIR if self.path == "/xask" else ASK_QUEUE_DIR
             with open(os.path.join(queue_dir, f"{req_id}.json"), "w") as f:
                 json.dump(ask_data, f)
             self._json({"status": "queued"})
 
         elif self.path == "/tool_call":
+            if not self._body_instance_is_current(body, instance_id):
+                return
             req_id = body.get("request_id", "")
             if not _safe_request_id(req_id):
                 self._json({"status": "error", "message": "Некорректный request_id"})
                 return
+            parent_request_id = body.get("parent_request_id", "")
+            parent = next(
+                (
+                    record for record in (
+                        _request_record("ask", parent_request_id),
+                        _request_record("xask", parent_request_id),
+                    )
+                    if record and hmac.compare_digest(str(record.get("instance_id", "")), instance_id)
+                ),
+                None,
+            )
+            if not parent:
+                self._error(403, "Запрос инструмента не принадлежит instance")
+                return
             call_data = {
-                "instance_id": body.get("instance_id", ""),
+                "instance_id": instance_id,
                 "chat_id": body.get("chat_id", ""),
                 "tool": body.get("tool", ""),
                 "args": body.get("args", {}),
-                "requester_id": body.get("requester_id"),
+                "requester_id": parent.get("requester_id", ""),
+                "owner_authorized": bool(parent.get("owner_authorized")),
                 "ts": time.time(),
             }
+            _record_request("tool", req_id, instance_id, parent.get("requester_id"))
             with open(os.path.join(TOOL_QUEUE_DIR, f"{req_id}.json"), "w") as f:
                 json.dump(call_data, f)
             self._json({"status": "queued"})
@@ -443,6 +612,8 @@ class Queue(BaseHTTPRequestHandler):
             req_id = body.get("request_id", "")
             if not _safe_request_id(req_id):
                 self._json({"status": "error", "message": "Некорректный request_id"})
+                return
+            if not self._owns_request("tool", req_id, instance_id):
                 return
             with open(os.path.join(TOOL_RESULT_DIR, f"{req_id}.json"), "w") as f:
                 json.dump({"done": True, "result": body.get("result", "")}, f)
@@ -458,17 +629,22 @@ class Queue(BaseHTTPRequestHandler):
                 self._json({"text": None})
 
         elif self.path == "/classify":
-            result = classify_semantic(body.get("text", ""), body.get("condition", ""))
+            if not self._body_instance_is_current(body, instance_id):
+                return
+            result = classify_semantic(body.get("text", ""), body.get("condition", ""), instance_id)
             self._json({"result": result})
 
         elif self.path == "/xclassify":
-            result = classify_semantic_codex(body.get("text", ""), body.get("condition", ""))
+            if not self._body_instance_is_current(body, instance_id):
+                return
+            result = classify_semantic_codex(body.get("text", ""), body.get("condition", ""), instance_id)
             self._json({"result": result})
 
         elif self.path == "/xreset":
             chat_id = body.get("chat_id", "")
-            instance_id = body.get("instance_id") or "andrey_codex"
-            if not chat_id or not _safe_instance_id(instance_id):
+            if not self._body_instance_is_current(body, instance_id):
+                return
+            if not chat_id:
                 self._json({"status": "error", "message": "Некорректные chat_id или instance_id"})
                 return
             reset_id = f"reset_{uuid.uuid4().hex}"
@@ -482,9 +658,7 @@ class Queue(BaseHTTPRequestHandler):
             # .ask/.xask with no restart. Owner-only in practice: the only
             # caller is the userbot's own owner-scoped .persona/.xpersona
             # command.
-            instance_id = body.get("instance_id") or ""
-            if not _safe_instance_id(instance_id):
-                self._json({"status": "error", "message": "Некорректный instance_id"})
+            if not self._body_instance_is_current(body, instance_id):
                 return
             persona_dir = _persona_dir_for(self.path)
             os.makedirs(persona_dir, exist_ok=True)
@@ -543,9 +717,7 @@ class Queue(BaseHTTPRequestHandler):
                 # from one would wipe -- the other's session with that
                 # contact. Missing/default instance_id keeps the original
                 # filename so the existing deployed client needs no change.
-                instance_id = body.get("instance_id") or "andrey"
-                if not _safe_instance_id(instance_id):
-                    self._json({"status": "error", "message": "Некорректный instance_id"})
+                if not self._body_instance_is_current(body, instance_id):
                     return
                 sessions_file = _sessions_enc_file(instance_id)
                 cleared = False
@@ -568,23 +740,34 @@ class Queue(BaseHTTPRequestHandler):
             else:
                 self._json({"status": "error", "message": "Нет chat_id"})
 
+        elif self.path == "/artifact":
+            if not self._body_instance_is_current(body, instance_id):
+                return
+            if not _register_artifact(instance_id, str(body.get("path") or "")):
+                self._error(404, "Артефакт не найден")
+                return
+            self._json({"status": "ok"})
+
     def do_GET(self):
+        instance_id = self._authenticate()
+        if instance_id is None:
+            return
         if self.path.startswith("/download"):
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             filepath = params.get("path", [None])[0]
-            # Scoped to /tmp -- the only directory this app itself ever
-            # writes into (/upload's save_path, claude_watcher.py's WORKDIR
-            # for SEND_FILE). Without this, a plain GET with no auth at all
-            # could read any file the `mishin` user can read (confirmed
-            # live: /etc/passwd, jarvis-ask/.session_key_*, state*.json) --
-            # and this endpoint is proxied to the public internet via
-            # Tailscale Funnel. realpath() resolves both symlinks and any
-            # ../ traversal before the prefix check, so neither can escape
-            # the allowed root.
             resolved = os.path.realpath(filepath) if filepath else None
-            allowed = resolved and (resolved == "/tmp" or resolved.startswith("/tmp" + os.sep))
-            if allowed and os.path.isfile(resolved):
+            if not resolved or not _artifact_registered(instance_id, resolved):
+                # A manifest belonging to another instance gets a distinct
+                # forbidden response; an unregistered path never discloses
+                # whether any file exists at that location.
+                other_owner = any(
+                    _artifact_registered(candidate, resolved)
+                    for candidate in set(RELAY_TOKENS.values()) if candidate != instance_id
+                )
+                self._error(403 if other_owner else 404, "Артефакт недоступен")
+                return
+            if os.path.isfile(resolved):
                 filepath = resolved
                 with open(filepath, "rb") as f:
                     data = f.read()
@@ -615,7 +798,7 @@ class Queue(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
             else:
-                self._json({"error": "File not found"})
+                self._error(404, "Артефакт не найден")
             return
 
         if self.path == "/cmd":
@@ -637,9 +820,8 @@ class Queue(BaseHTTPRequestHandler):
 
         elif self.path.startswith("/persona") or self.path.startswith("/xpersona"):
             qs = urllib.parse.urlparse(self.path).query
-            instance_id = urllib.parse.parse_qs(qs).get("instance_id", [""])[0]
-            if not _safe_instance_id(instance_id):
-                self._json({"status": "error", "message": "Некорректный instance_id"})
+            params = urllib.parse.parse_qs(qs)
+            if not self._query_instance_is_current(params, instance_id):
                 return
             text, source = _persona_read(_persona_dir_for(self.path), instance_id)
             self._json({"status": "ok", "persona": text, "source": source})
@@ -654,6 +836,9 @@ class Queue(BaseHTTPRequestHandler):
             qs = urllib.parse.urlparse(self.path).query
             req_id = urllib.parse.parse_qs(qs).get("request_id", [""])[0]
             result_dir = XASK_RESULT_DIR if self.path.startswith("/xask") else ASK_RESULT_DIR
+            kind = "xask" if self.path.startswith("/xask") else "ask"
+            if not self._owns_request(kind, req_id, instance_id):
+                return
             result_path = os.path.join(result_dir, f"{req_id}.json") if _safe_request_id(req_id) else None
             if result_path and os.path.exists(result_path):
                 try:
@@ -671,8 +856,10 @@ class Queue(BaseHTTPRequestHandler):
             # returns the oldest pending call for this instance_id, or
             # {"tool": None} if the queue's empty for it.
             qs = urllib.parse.urlparse(self.path).query
-            instance_id = urllib.parse.parse_qs(qs).get("instance_id", [""])[0]
-            data = _pop_pending_tool_call(instance_id) if instance_id else None
+            params = urllib.parse.parse_qs(qs)
+            if not self._query_instance_is_current(params, instance_id):
+                return
+            data = _pop_pending_tool_call(instance_id)
             self._json(data or {"tool": None})
 
         elif self.path.startswith("/tool_call"):
@@ -681,6 +868,8 @@ class Queue(BaseHTTPRequestHandler):
             # posts back via POST /tool_call_result.
             qs = urllib.parse.urlparse(self.path).query
             req_id = urllib.parse.parse_qs(qs).get("request_id", [""])[0]
+            if not self._owns_request("tool", req_id, instance_id):
+                return
             result_path = os.path.join(TOOL_RESULT_DIR, f"{req_id}.json") if _safe_request_id(req_id) else None
             if result_path and os.path.exists(result_path):
                 try:
@@ -711,9 +900,56 @@ class Queue(BaseHTTPRequestHandler):
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
-    def _json(self, data):
+    def _authenticate(self):
+        value = self.headers.get("Authorization", "")
+        if not value.startswith("Bearer ") or not value[7:]:
+            self._error(401, "Требуется Authorization: Bearer <token>")
+            return None
+        digest = hashlib.sha256(value[7:].encode("utf-8")).hexdigest()
+        matched = None
+        # Do not use a direct dictionary lookup for a credential comparison.
+        # All configured digests have the same fixed length, so every compare
+        # is constant-time with respect to the token value.
+        for stored_digest, candidate_instance in RELAY_TOKENS.items():
+            if hmac.compare_digest(digest, stored_digest):
+                matched = candidate_instance
+        if matched is None:
+            self._error(401, "Недействительный relay token")
+            return None
+        return matched
+
+    def _body_instance_is_current(self, body, instance_id):
+        if "instance_id" in body and not hmac.compare_digest(str(body["instance_id"]), instance_id):
+            self._error(403, "instance_id не соответствует relay token")
+            return False
+        return True
+
+    def _query_instance_is_current(self, params, instance_id):
+        values = params.get("instance_id")
+        if values and not hmac.compare_digest(str(values[0]), instance_id):
+            self._error(403, "instance_id не соответствует relay token")
+            return False
+        return True
+
+    def _owns_request(self, kind, request_id, instance_id):
+        if not _safe_request_id(request_id):
+            self._error(404, "Запрос не найден")
+            return False
+        record = _request_record(kind, request_id)
+        if record is None:
+            self._error(404, "Запрос не найден")
+            return False
+        if not hmac.compare_digest(str(record.get("instance_id", "")), instance_id):
+            self._error(403, "Запрос принадлежит другому instance")
+            return False
+        return True
+
+    def _error(self, status, message):
+        self._json({"status": "error", "message": message}, status=status)
+
+    def _json(self, data, status=200):
         body = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
@@ -730,11 +966,71 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+def _add_token(instance_id):
+    if not _safe_instance_id(instance_id):
+        raise RuntimeError("Некорректный instance_id")
+    path = os.environ.get("JARVIS_RELAY_TOKENS_FILE")
+    if not path:
+        raise RuntimeError("JARVIS_RELAY_TOKENS_FILE не задан")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            entries = json.load(handle)
+    except FileNotFoundError:
+        entries = {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Не удалось прочитать tokens-файл: {exc}") from exc
+    if not isinstance(entries, dict):
+        raise RuntimeError("tokens-файл должен быть JSON-объектом")
+    token = secrets.token_urlsafe(32)
+    entries[hashlib.sha256(token.encode("utf-8")).hexdigest()] = instance_id
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    _atomic_json(path, entries)
+    os.chmod(path, 0o600)
+    return token
+
+
+def _bind_addresses():
+    raw = os.environ.get("JARVIS_RELAY_BIND") or os.environ.get("JARVIS_QUEUE_BIND") or "127.0.0.1"
+    addresses = [value.strip() for value in raw.split(",") if value.strip()]
+    if not addresses:
+        raise RuntimeError("JARVIS_RELAY_BIND не содержит адресов")
+    return addresses
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--add-token"]:
+        if len(argv) != 2:
+            raise RuntimeError("Использование: cmd_queue.py --add-token <instance_id>")
+        print(_add_token(argv[1]))  # printed once; only its hash is persisted
+        return 0
+    if argv not in ([], ["--check-config"]):
+        raise RuntimeError("Использование: cmd_queue.py [--check-config | --add-token <instance_id>]")
+    _load_relay_config()
+    if argv == ["--check-config"]:
+        print("relay configuration OK")
+        return 0
+    servers = [
+        ThreadingHTTPServer((address, int(os.environ.get("JARVIS_QUEUE_PORT", "9092"))), Queue)
+        for address in _bind_addresses()
+    ]
+    threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers[1:]]
+    for thread in threads:
+        thread.start()
+    try:
+        servers[0].serve_forever()
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join()
+    return 0
+
+
 if __name__ == "__main__":
-    ThreadingHTTPServer(
-        (
-            os.environ.get("JARVIS_QUEUE_BIND", "0.0.0.0"),
-            int(os.environ.get("JARVIS_QUEUE_PORT", "9092")),
-        ),
-        Queue,
-    ).serve_forever()
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        print(f"cmd_queue: {exc}", file=sys.stderr)
+        raise SystemExit(1)

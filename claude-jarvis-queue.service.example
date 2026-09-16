@@ -13,6 +13,11 @@ Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/s
 # persona's profanity is suppressed. Written by setup.sh; '-' = ok if absent.
 EnvironmentFile=-__INSTALL_DIR__/jarvis.env
 Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
+# Required relay auth configuration. Keep both JSON files outside the checkout
+# and mode 0600; token values themselves never appear in either file here.
+Environment=JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json
+Environment=JARVIS_RELAY_OWNERS_FILE=/etc/jarvis-ask/relay-owners.json
+Environment=JARVIS_RELAY_BIND=127.0.0.1
 ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/cmd_queue.py
 Restart=always
 RestartSec=3
