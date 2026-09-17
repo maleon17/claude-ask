@@ -32,6 +32,18 @@ def test_safe_edit_plain_fallback_explicitly_disables_html():
     assert message.edits[-1] == ("literal <tag>", {"parse_mode": None})
 
 
+def test_telegram_text_limit_resolves_without_test_side_overrides():
+    """Regression: TELEGRAM_TEXT_LIMIT was a bare module-level name, not a
+    class attribute, so self.TELEGRAM_TEXT_LIMIT raised AttributeError on
+    every real instance -- _dispatch_answer crashed before delivering ANY
+    final answer, short or long. The sibling test above sets
+    bot.TELEGRAM_TEXT_LIMIT directly and would never have caught this."""
+    bot = make_module()
+    message = Message()
+    run(bot._dispatch_answer(None, 1, "q", "chat", 0, message, "short answer", []))
+    assert message.edits and "short answer" in message.edits[-1][0]
+
+
 def test_final_answer_is_split_and_failed_edit_is_visible():
     bot = make_module()
     message = Message()
