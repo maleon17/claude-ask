@@ -1,0 +1,10 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: python -m py_compile claude_ask.py claude_watcher.py cmd_queue.py mcp_telegram_tools.py
+      - run: ./scripts/run_tests.sh

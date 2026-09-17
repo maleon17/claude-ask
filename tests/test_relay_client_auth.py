@@ -20,9 +20,9 @@ def test_client_enqueues_with_bearer_token(monkeypatch):
     bot = make_module()
     monkeypatch.setattr(claude_ask, "RELAY_TOKEN", "client-secret")
     captured = []
-    monkeypatch.setattr(claude_ask.urllib.request, "urlopen", lambda request, **_: captured.append(request) or _Response())
+    monkeypatch.setattr(bot, "_relay_open", lambda request, *_: captured.append(request) or _Response())
 
-    assert bot._enqueue("question", "7", "request-7")
+    assert bot._enqueue("question", "7", "request-7")[0]
     assert captured[0].get_header("Authorization") == "Bearer client-secret"
 
 
@@ -31,7 +31,7 @@ def test_upload_boundary_is_not_reused_from_payload(monkeypatch):
     bot = make_module()
     captured = []
     monkeypatch.setattr(claude_ask, "RELAY_TOKEN", "client-secret")
-    monkeypatch.setattr(claude_ask.urllib.request, "urlopen", lambda request, **_: captured.append(request) or _Response())
+    monkeypatch.setattr(claude_ask, "RELAY_OPENER", type("O", (), {"open": lambda _, request, **__: captured.append(request) or _Response()})())
     monkeypatch.setattr(claude_ask.secrets, "token_hex", lambda _: "collision")
 
     with patch.object(claude_ask.secrets, "token_hex", side_effect=["collision", "safe-boundary"]):

@@ -499,7 +499,7 @@ def run_claude_streaming(
             text=True, bufsize=1, env=env,
         )
     except Exception as e:
-        return f"Ошибка Claude: {e}", [], session_id
+        return f"[[backend_error:claude_start]] Ошибка Claude: {e}", [], session_id
 
     draft_thought = None
     draft_cmd_label = None
@@ -640,7 +640,7 @@ def run_claude_streaming(
         if proc.poll() is None:
             proc.kill()
 
-    return (final_text if final_text is not None else "(нет ответа)"), thought_history, new_session_id
+    return (final_text if final_text is not None else "[[backend_error:claude_no_response]] (нет ответа)"), thought_history, new_session_id
 
 
 def call_llm(

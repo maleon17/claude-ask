@@ -19,7 +19,8 @@ Environment=CLAUDE_JARVIS_MCP_CONFIG=__INSTALL_DIR__/mcp_telegram_tools_config.j
 Environment=CLAUDE_JARVIS_ASK_QUEUE=/tmp/jarvisask_ask_queue/
 Environment=CLAUDE_JARVIS_ASK_RESULT=/tmp/jarvisask_ask_result/
 Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
-ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/claude_watcher.py
+Environment=JARVIS_TELEGRAM_MCP_PATH=__JARVIS_TELEGRAM_MCP_PATH__
+ExecStart=__VENV_PYTHON__ -u __INSTALL_DIR__/claude_watcher.py
 Restart=always
 RestartSec=3
 KillMode=control-group

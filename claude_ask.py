@@ -56,10 +56,15 @@ BACKEND_URL = os.environ.get("CLAUDE_JARVIS_BACKEND_URL", "http://100.98.146.81:
 # simply unreachable and every /ask request silently vanishes. Still
 # overridable/disableable via env var for a future host that doesn't need it.
 HTTP_PROXY = os.environ.get("CLAUDE_JARVIS_HTTP_PROXY", "http://localhost:1056")
-if HTTP_PROXY:
-    urllib.request.install_opener(
-        urllib.request.build_opener(urllib.request.ProxyHandler({"http": HTTP_PROXY}))
-    )
+
+
+def _make_relay_opener(proxy):
+    """An Ask instance must never replace urllib's process-global opener."""
+    handlers = [urllib.request.ProxyHandler({"http": proxy})] if proxy else []
+    return urllib.request.build_opener(*handlers)
+
+
+RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
 # Explicit now (was implicit -- claude_watcher.py defaulted a missing
 # instance_id to "andrey").
 INSTANCE_ID = os.environ.get("CLAUDE_JARVIS_INSTANCE_ID", "andrey")
@@ -67,6 +72,7 @@ RELAY_TOKEN = os.environ.get("CLAUDE_JARVIS_RELAY_TOKEN", "")
 ENGINE = "claude"
 MAX_ROUNDS = 5  # mirrors claude_watcher.py's own round discipline
 POLL_TIMEOUT_S = 600  # agentic file-editing tasks can genuinely take a while
+TELEGRAM_TEXT_LIMIT = 3500
 # Telegram exposes every streaming edit as a separate update but gives no
 # "generation finished" event. Wait for a short quiet period before semantic
 # triggers inspect the message's final revision.
@@ -294,7 +300,7 @@ class ClaudeAsk(loader.Module):
     # -- Forum topics (Phase 1 infra) -----------------------------------------
 
     async def client_ready(self):
-        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN
+        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN, RELAY_OPENER
 
         self._topics = {}
         self._owner_id_cache = None
@@ -325,14 +331,7 @@ class ClaudeAsk(loader.Module):
             HTTP_PROXY = network.get("http_proxy", HTTP_PROXY)
             INSTANCE_ID = network.get("instance_id", INSTANCE_ID)
             RELAY_TOKEN = network.get("relay_token", RELAY_TOKEN)
-            if HTTP_PROXY:
-                urllib.request.install_opener(
-                    urllib.request.build_opener(
-                        urllib.request.ProxyHandler({"http": HTTP_PROXY})
-                    )
-                )
-            else:
-                urllib.request.install_opener(urllib.request.build_opener())
+            RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
         await self._ensure_topics()
         if HTTP_PROXY:
             # Only instances that actually route through a local tailscaled
@@ -677,7 +676,8 @@ class ClaudeAsk(loader.Module):
                     if mode:
                         await message.edit(text, parse_mode=mode)
                     else:
-                        await message.edit(text)
+                        await message.edit(text, parse_mode=None)
+                    setattr(message, "_jarvis_edit_failed", False)
                     return message
                 except asyncio.CancelledError:
                     raise
@@ -692,6 +692,7 @@ class ClaudeAsk(loader.Module):
                     # A parse-mode failure gets the plain-edit retry above;
                     # other failures leave the same message untouched.
                     break
+        setattr(message, "_jarvis_edit_failed", True)
         return message
 
     async def _get_reply_text(self, message):
@@ -728,7 +729,7 @@ class ClaudeAsk(loader.Module):
                 headers=_relay_headers(f"multipart/form-data; boundary={boundary}"),
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with RELAY_OPENER.open(req, timeout=60) as r:
                 return json.loads(r.read())
 
         try:
@@ -798,7 +799,7 @@ class ClaudeAsk(loader.Module):
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with RELAY_OPENER.open(req, timeout=60) as r:
                 return json.loads(r.read())
 
         try:
@@ -1087,8 +1088,9 @@ class ClaudeAsk(loader.Module):
 
         if anchor is None:
             text = await self._get_chat_history(message, limit=fallback_limit)
-            self.db.set("ClaudeAsk", key, message.id)
-            return text, False
+            if text.startswith("[Не удалось получить историю:"):
+                return text, False, None
+            return text, False, (key, message.id)
 
         try:
             kwargs = {"reply_to": topic_id} if topic_id else {}
@@ -1096,13 +1098,11 @@ class ClaudeAsk(loader.Module):
                 chat_id, min_id=anchor, limit=self.HISTORY_DELTA_CAP, **kwargs,
             )
         except Exception as e:
-            return f"[Не удалось получить историю: {e}]", True
+            return f"[Не удалось получить историю: {e}]", True, None
 
         newest_id = max([message.id] + [m.id for m in new_msgs])
-        self.db.set("ClaudeAsk", key, newest_id)
-
         if not new_msgs:
-            return "", True
+            return "", True, (key, newest_id)
 
         try:
             anchor_msgs = await self._client.get_messages(chat_id, ids=[anchor])
@@ -1111,7 +1111,30 @@ class ClaudeAsk(loader.Module):
             anchor_msg = None
 
         ordered = ([anchor_msg] if anchor_msg else []) + list(reversed(new_msgs))
-        return await self._format_messages(ordered), True
+        return await self._format_messages(ordered), True, (key, newest_id)
+
+    def _commit_history_anchor(self, pending):
+        if pending:
+            key, newest_id = pending
+            self.db.set("ClaudeAsk", key, newest_id)
+
+    def _clear_history_anchors(self, chat_id):
+        """A reset covers every forum-topic cursor belonging to the chat.
+
+        Heroku's Database class subclasses dict directly (confirmed against
+        the live framework source, /Heroku/heroku/database.py) -- there is
+        no separate ._db/.values mapping to introspect. dict.get() is
+        called explicitly because Database overrides the 2-arg .get() with
+        its own 3-arg (owner, key, default) signature."""
+        prefix = f"last_seen_id_{chat_id}"
+        self.db.set("ClaudeAsk", prefix, None)
+        namespace = dict.get(self.db, "ClaudeAsk") or {}
+        for key in list(namespace):
+            if str(key).startswith(prefix + "_"):
+                self.db.set("ClaudeAsk", key, None)
+
+    def _relay_open(self, request, timeout):
+        return RELAY_OPENER.open(request, timeout=timeout)
 
     def _enqueue(
         self, question, chat_id, req_id, mode="chat", topic_id=None,
@@ -1136,16 +1159,26 @@ class ClaudeAsk(loader.Module):
             if requester_id is not None:
                 payload["requester_id"] = requester_id
             data = json.dumps(payload).encode()
-            urllib.request.urlopen(
-                urllib.request.Request(
+            with self._relay_open(urllib.request.Request(
                     f"{BACKEND_URL}/ask", data=data,
                     headers=_relay_headers("application/json"), method="POST",
-                ),
-                timeout=5,
-            )
-            return True
-        except Exception:
-            return False
+                ), 5) as response:
+                result = json.loads(response.read() or b"{}")
+            # cmd_queue.py's success statuses for /ask are "queued" (fresh
+            # request) and "accepted" (idempotent retry of a request_id it
+            # already has) -- never "ok". Only its explicit "error" means
+            # rejection; matching just "ok" here would treat every real
+            # success as a failure.
+            if result.get("status") == "error":
+                return False, str(result.get("message") or "relay rejected request")
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    async def _enqueue_async(self, *args, **kwargs):
+        """Keep relay I/O outside the Telethon event loop."""
+        result = await asyncio.to_thread(self._enqueue, *args, **kwargs)
+        return result if isinstance(result, tuple) else (bool(result), "")
 
     def _fetch_pending_tool_call(self):
         """Polled by tool_call_watcher below -- the opposite direction from
@@ -1157,12 +1190,12 @@ class ClaudeAsk(loader.Module):
         being pushed to."""
         qs = urllib.parse.urlencode({"instance_id": INSTANCE_ID})
         req = urllib.request.Request(f"{BACKEND_URL}/tool_call_pending?{qs}", headers=_relay_headers())
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with RELAY_OPENER.open(req, timeout=5) as r:
             return json.loads(r.read())
 
     def _post_tool_call_result(self, request_id, result):
         data = json.dumps({"request_id": request_id, "result": result}).encode()
-        urllib.request.urlopen(
+        RELAY_OPENER.open(
             urllib.request.Request(
                 f"{BACKEND_URL}/tool_call_result", data=data,
                 headers=_relay_headers("application/json"), method="POST",
@@ -1176,7 +1209,7 @@ class ClaudeAsk(loader.Module):
         # relay needs to know which one to fetch.
         qs = urllib.parse.urlencode({"request_id": req_id})
         req = urllib.request.Request(f"{BACKEND_URL}/ask?{qs}", headers=_relay_headers())
-        with urllib.request.urlopen(req, timeout=3) as r:
+        with RELAY_OPENER.open(req, timeout=3) as r:
             return json.loads(r.read())
 
     async def _poll_progress_and_result(self, message, req_id, animate=False):
@@ -1215,9 +1248,11 @@ class ClaudeAsk(loader.Module):
         # call now that the actual bug is gone; re-flag FloodWait if it
         # ever resurfaces at this speed specifically.
         sleep_s = 0.5 if animate else 1
-        ticks = int(POLL_TIMEOUT_S / sleep_s)
-        for _ in range(ticks):
-            await asyncio.sleep(sleep_s)
+        deadline = time.monotonic() + POLL_TIMEOUT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(sleep_s, max(0, deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                break
             try:
                 d = await loop.run_in_executor(None, self._fetch_ask_status, req_id)
             except Exception:
@@ -1302,7 +1337,7 @@ class ClaudeAsk(loader.Module):
                     f"{BACKEND_URL}/download?path={urllib.parse.quote(path)}",
                     headers=_relay_headers(),
                 )
-                with urllib.request.urlopen(req, timeout=60) as r:
+                with RELAY_OPENER.open(req, timeout=60) as r:
                     return r.read()
 
             data = await loop.run_in_executor(None, fetch)
@@ -2438,7 +2473,7 @@ class ClaudeAsk(loader.Module):
                 f"{BACKEND_URL}/classify", data=data,
                 headers=_relay_headers("application/json"), method="POST",
             )
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with RELAY_OPENER.open(req, timeout=15) as r:
                 return json.loads(r.read())
 
         try:
@@ -2587,11 +2622,12 @@ class ClaudeAsk(loader.Module):
         async with self._agent_trigger_lock(message.chat_id):
             self._agent_turn_sent[str(message.chat_id)] = False
             req_id = str(uuid.uuid4())
-            if not self._enqueue(
+            enqueued, _ = await self._enqueue_async(
                 question, message.chat_id, req_id, "chat",
                 topic_id=self._topic_of(message),
                 requester_id=self._trigger_requester_id(trig, message),
-            ):
+            )
+            if not enqueued:
                 # The sibling backend may still use the legacy owner
                 # requester for trigger fallbacks. Fail closed instead of
                 # handing an autonomous trigger to an unsafe implementation.
@@ -2795,11 +2831,12 @@ class ClaudeAsk(loader.Module):
         async with self._agent_trigger_lock(message.chat_id):
             self._agent_turn_sent[str(message.chat_id)] = False
             req_id = str(uuid.uuid4())
-            if not self._enqueue(
+            enqueued, _ = await self._enqueue_async(
                 prompt, message.chat_id, req_id, "chat",
                 topic_id=self._topic_of(message),
                 requester_id=self._trigger_requester_id(trig, message),
-            ):
+            )
+            if not enqueued:
                 # The sibling backend may still use the legacy owner
                 # requester for trigger fallbacks. Fail closed instead of
                 # handing an autonomous trigger to an unsafe implementation.
@@ -3653,7 +3690,7 @@ class ClaudeAsk(loader.Module):
             # file to fetch, and _get_reply_file already returns None for
             # that (msg has no document/photo/etc to match).
             reply_file = await self._get_reply_file(message)
-            chat_history, is_delta = await self._get_chat_history_delta(message)
+            chat_history, is_delta, pending_anchor = await self._get_chat_history_delta(message)
 
             # Time is otherwise completely outside Claude's context -- a
             # session resumed across days/weeks has no way to tell "this
@@ -3731,18 +3768,22 @@ class ClaudeAsk(loader.Module):
         answer, thoughts = [None, []]
         topic_id = self._topic_of(message)
         enqueued = False
+        enqueue_error = ""
         async with self._client.action(chat_id, "typing"):
-            if self._enqueue(
+            enqueued, enqueue_error = await self._enqueue_async(
                 question, chat_id, req_id, mode, topic_id=topic_id,
                 exclude_id=work_message.id,
                 requester_id=getattr(message, "sender_id", None),
-            ):
+            )
+            if enqueued:
+                if round_num == 0:
+                    self._commit_history_anchor(pending_anchor)
                 enqueued = True
                 work_message, answer, thoughts = await self._poll_progress_and_result(
                     work_message, req_id, animate=animate,
                 )
 
-        if allow_fallback and (not enqueued or self._backend_failed(answer)):
+        if allow_fallback and self._backend_failed(answer):
             fallback = self._fallback_backend()
             if fallback is not None:
                 return await fallback._do_ask(
@@ -3751,6 +3792,13 @@ class ClaudeAsk(loader.Module):
                     allow_fallback=False,
                 )
 
+        if not enqueued:
+            await self._safe_edit(
+                work_message,
+                f"<blockquote>💬 {_h(orig_question)}</blockquote>\n<blockquote>🤖 ❌ Запрос не принят backend: {_h(enqueue_error or 'неизвестная ошибка')}.</blockquote>",
+                parse_mode="html",
+            )
+            return
         if answer is None:
             await self._safe_edit(
                 work_message,
@@ -3803,18 +3851,25 @@ class ClaudeAsk(loader.Module):
         # conflict entirely; the recap lines above it still use blockquote
         # normally since they never contain model-authored HTML.
         recap = "".join(f"\n<blockquote>🤔 {_h(t)}</blockquote>" for t in thoughts)
+        final_text = f"<blockquote>💬 {_h(orig_question)}</blockquote>{recap}\n🤖 {answer}"
+        if len(final_text) <= self.TELEGRAM_TEXT_LIMIT:
+            await self._safe_edit(work_message, final_text, parse_mode="html")
+            return
         await self._safe_edit(
             work_message,
-            f"<blockquote>💬 {_h(orig_question)}</blockquote>{recap}\n🤖 {answer}",
-            parse_mode="html",
+            "✅ Ответ готов. Отправляю его следующими сообщениями.", parse_mode="html",
         )
+        prefix = "⚠️ Не удалось обновить исходное сообщение; полный ответ отправлен частями.\n" if getattr(work_message, "_jarvis_edit_failed", False) else ""
+        for start in range(0, len(answer), self.TELEGRAM_TEXT_LIMIT):
+            await work_message.respond(prefix + answer[start:start + self.TELEGRAM_TEXT_LIMIT])
+            prefix = ""
 
     # -- Commands -------------------------------------------------------------
 
     @loader.command()
     async def asknet(self, message):
         """Настроить instance_id, backend URL и HTTP proxy"""
-        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN
+        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN, RELAY_OPENER
 
         work_message = await self._work_message(message)
 
@@ -3878,14 +3933,7 @@ class ClaudeAsk(loader.Module):
             "http_proxy": HTTP_PROXY,
             "relay_token": RELAY_TOKEN,
         })
-        if HTTP_PROXY:
-            urllib.request.install_opener(
-                urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": HTTP_PROXY})
-                )
-            )
-        else:
-            urllib.request.install_opener(urllib.request.build_opener())
+        RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
         await self._safe_edit(
             work_message,
             "✅ Сетевая конфигурация применена\n"
@@ -3958,7 +4006,7 @@ class ClaudeAsk(loader.Module):
         # own memory of the chat is gone too now, so the next .ask should
         # fall back to a full fixed-window fetch, not "just what's new since
         # the old (now-forgotten) anchor".
-        self.db.set("ClaudeAsk", f"last_seen_id_{chat_id}", None)
+        self._clear_history_anchors(chat_id)
         try:
             data = json.dumps({"chat_id": str(chat_id), "instance_id": INSTANCE_ID}).encode()
             loop = asyncio.get_running_loop()
@@ -3968,7 +4016,7 @@ class ClaudeAsk(loader.Module):
                     f"{BACKEND_URL}/reset", data=data,
                     headers=_relay_headers("application/json"), method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=5) as r:
+                with RELAY_OPENER.open(req, timeout=5) as r:
                     return json.loads(r.read())
 
             result = await loop.run_in_executor(None, do_reset)
@@ -3981,7 +4029,7 @@ class ClaudeAsk(loader.Module):
         data = json.dumps(payload).encode() if payload is not None else None
         headers = _relay_headers("application/json") if data else _relay_headers()
         req = urllib.request.Request(f"{BACKEND_URL}{path}", data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with RELAY_OPENER.open(req, timeout=10) as r:
             return json.loads(r.read())
 
     @loader.command()
@@ -4139,9 +4187,11 @@ class ClaudeAsk(loader.Module):
         try:
             msg = await self._client.get_messages(s["chat_id"], ids=s["code_msg_id"])
         except Exception:
-            return
-        if msg:
-            s["pages"][s["index"]] = _persona_unguard(msg.raw_text or "")
+            return False
+        if not msg:
+            return False
+        s["pages"][s["index"]] = _persona_unguard(msg.raw_text or "")
+        return True
 
     async def _cb_persona_noop(self, call):
         await self._persona_ack(call)
@@ -4157,18 +4207,21 @@ class ClaudeAsk(loader.Module):
         if not s:
             await self._persona_ack(call, "Сессия истекла — открой .persona заново", alert=True)
             return
-        await self._persona_persist_page(s)
+        if not await self._persona_persist_page(s):
+            await self._persona_ack(call, "❌ Ошибка чтения черновика; переход отменён", alert=True)
+            return
         new_index = s["index"] + direction
         if new_index < 0 or new_index >= len(s["pages"]):
             await self._persona_ack(call, "Это край")
             return
-        s["index"] = new_index
         try:
             await self._client.edit_message(
                 s["chat_id"], s["code_msg_id"], _persona_pre(s["pages"][new_index]),
             )
         except Exception:
-            pass
+            await self._persona_ack(call, "❌ Ошибка показа страницы; переход отменён", alert=True)
+            return
+        s["index"] = new_index
         await self._persona_call_edit(call, self._persona_panel_text(s), self._persona_buttons(s))
         await self._persona_ack(call)
 
@@ -4192,7 +4245,9 @@ class ClaudeAsk(loader.Module):
         if not s:
             await self._persona_ack(call, "Сессия истекла — открой .persona заново", alert=True)
             return
-        await self._persona_persist_page(s)
+        if not await self._persona_persist_page(s):
+            await self._persona_ack(call, "❌ Ошибка чтения черновика; сохранение отменено", alert=True)
+            return
         new_text = "".join(s["pages"]).rstrip("\n")
         loop = asyncio.get_running_loop()
         try:

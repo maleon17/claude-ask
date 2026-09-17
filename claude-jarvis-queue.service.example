@@ -18,7 +18,7 @@ Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
 Environment=JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json
 Environment=JARVIS_RELAY_OWNERS_FILE=/etc/jarvis-ask/relay-owners.json
 Environment=JARVIS_RELAY_BIND=127.0.0.1
-ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/cmd_queue.py
+ExecStart=__VENV_PYTHON__ -u __INSTALL_DIR__/cmd_queue.py
 Restart=always
 RestartSec=3
 KillMode=control-group

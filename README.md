@@ -2,7 +2,7 @@
 
 > Part of **[telegram-ai](https://github.com/maleon17/telegram-ai)** — Claude/Codex ↔ Telegram, four ways.
 
-A standalone Telegram userbot/backend for ClaudeAsk. It lets the owner
+A Telegram userbot/backend for ClaudeAsk. It lets the owner
 invoke Jarvis with the `.ask` command in any Telegram chat and perform real
 actions through their own Telethon session. This is not the Bot API bridge
 and not codex-ask.
@@ -13,7 +13,7 @@ Repository: <https://github.com/maleon17/claude-ask>
 
 - `claude_ask.py` — the main loadable ClaudeAsk module;
 - `claude_watcher.py` — the Claude Code backend with persistent sessions;
-- `mcp_telegram_tools.py` — MCP tools for Telegram account actions;
+- `mcp_telegram_tools.py` — launcher for the required CodexAsk MCP implementation;
 - `cmd_queue.py` — the shared HTTP queue relay for `.ask` and `.xask`;
 - `setup.sh` and service examples — backend infrastructure setup.
 
@@ -56,7 +56,9 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-The script creates the MCP virtualenv, a local
+ClaudeAsk depends on the CodexAsk checkout's `telegram_actions_mcp.py`; setup
+asks for that path (or uses `JARVIS_TELEGRAM_MCP_PATH`) and validates it. The
+script creates the MCP virtualenv, a local
 `mcp_telegram_tools_config.json`, and a runtime directory. Service templates
 need `__USER__` and `__INSTALL_DIR__` replaced; the queue relay should only
 be installed once per host.
@@ -104,12 +106,18 @@ resets and registered download artifacts are all scoped to that instance.
 ## Verification and updates
 
 ```bash
-python3 -m py_compile claude_watcher.py cmd_queue.py mcp_telegram_tools.py
+./scripts/run_tests.sh
 systemctl status jarvis-ask-watcher
 journalctl -u jarvis-ask-watcher -f
 ```
 
 A plain `docker cp` does not reload an already-running module.
+
+`requirements-dev.txt` declares pytest. CI runs the same test command without
+secrets or live services. ClaudeAsk has its own watcher; when CodexAsk and the
+optional `jarvis_ask.py` coordinator are loaded too, the coordinator chooses
+one trigger action per incoming message. Without it, each module keeps its
+separate legacy trigger behavior.
 
 ## Updating
 

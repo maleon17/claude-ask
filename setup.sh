@@ -20,6 +20,13 @@ python3 -m venv "$MCP_VENV"
 "$MCP_VENV/bin/python" -m pip install --upgrade pip >/dev/null
 "$MCP_VENV/bin/python" -m pip install -r requirements.txt -r requirements-mcp.txt
 
+DEFAULT_MCP_PATH="${JARVIS_TELEGRAM_MCP_PATH:-$HOME/codex-jarvis/telegram_actions_mcp.py}"
+if [ -t 0 ]; then
+    read -rp "CodexAsk telegram_actions_mcp.py [$DEFAULT_MCP_PATH]: " JARVIS_TELEGRAM_MCP_PATH
+fi
+JARVIS_TELEGRAM_MCP_PATH="${JARVIS_TELEGRAM_MCP_PATH:-$DEFAULT_MCP_PATH}"
+[[ -f "$JARVIS_TELEGRAM_MCP_PATH" ]] || die "CodexAsk MCP implementation not found: $JARVIS_TELEGRAM_MCP_PATH"
+
 sed \
     -e "s|__MCP_PYTHON__|$MCP_VENV/bin/python|g" \
     -e "s|__INSTALL_DIR__|$ROOT|g" \
@@ -34,7 +41,8 @@ echo "Prepared local MCP config: $ROOT/mcp_telegram_tools_config.json"
 echo "The queue relay is shared by ClaudeAsk and CodexAsk; do not start a second"
 echo "copy if an existing jarvis-ask-cmd-queue service is already running."
 echo
-echo "Install service examples manually after replacing placeholders:"
+echo "Install service examples manually after replacing __USER__, __INSTALL_DIR__,"
+echo "__VENV_PYTHON__ ($MCP_VENV/bin/python), and __JARVIS_TELEGRAM_MCP_PATH__."
 echo "  claude-jarvis-queue.service.example"
 echo "  claude-jarvis-watcher.service.example"
 echo "Finally upload claude_ask.py to the Telethon userbot and reply .lm."
