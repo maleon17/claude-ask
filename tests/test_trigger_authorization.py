@@ -132,6 +132,7 @@ def make_module(triggers=None):
     instance._agent_trigger_locks = {}
     instance._agent_turn_sent = {}
     instance._notify_topic = AsyncMock()
+    instance._build_trigger_chat_context = AsyncMock(return_value="fresh trigger history")
     return instance
 
 
@@ -141,6 +142,7 @@ def trigger(trigger_id="trigger-1", **extra):
         "kind": "keyword",
         "action": "agent",
         "instruction": "process the incoming message",
+        "include_chat_context": True,
     }
     value.update(extra)
     return value
@@ -171,6 +173,7 @@ def test_trigger_agent_and_reply_enqueue_non_owner_context(monkeypatch, action):
     assert requester_id == "trigger:trigger-1"
     assert requester_id != OWNER_ID
     assert not requester_id.isdigit()
+    assert kwargs["chat_context"] == "fresh trigger history"
 
 
 def test_reply_trigger_does_not_duplicate_successful_send_message(monkeypatch):
@@ -332,6 +335,7 @@ def test_agent_trigger_report_destination_is_validated_and_persisted():
     })
     assert error is None
     assert trigger_spec["report_to"] == "notify"
+    assert trigger_spec["include_chat_context"] is False
 
     _, error = bot._build_trigger({
         "kind": "keyword", "value": ["ping"], "action": "agent",

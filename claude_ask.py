@@ -1248,6 +1248,28 @@ class ClaudeAsk(loader.Module):
             key, newest_id = pending
             self.db.set("ClaudeAsk", key, newest_id)
 
+    async def _build_trigger_chat_context(self, message):
+        """Fresh trigger context without advancing the user's .ask cursor."""
+        reply_id = getattr(message, "reply_to_msg_id", None)
+        reply_text = await self._get_reply_text(message)
+        reply_file = await self._get_reply_file(message)
+        history = await self._get_chat_history(message, limit=15)
+        now_str = datetime.now().astimezone().strftime("%d.%m.%Y %H:%M")
+        parts = [f"Текущее время: {now_str}"]
+        if history:
+            parts.append(f"Свежая история чата:\n{history}")
+        if reply_id:
+            anchor = f"Реплай на сообщение (id={reply_id})"
+            if reply_text and reply_file:
+                parts.append(f"{anchor} (с подписью):\n{reply_text}\n{reply_file}")
+            elif reply_text:
+                parts.append(f"{anchor}:\n{reply_text}")
+            elif reply_file:
+                parts.append(f"{anchor}. {reply_file}")
+            else:
+                parts.append(f"{anchor}.")
+        return "\n\n".join(parts)
+
     def _clear_history_anchors(self, chat_id):
         """A reset covers every forum-topic cursor belonging to the chat.
 
@@ -1268,7 +1290,7 @@ class ClaudeAsk(loader.Module):
 
     def _enqueue(
         self, question, chat_id, req_id, mode="chat", topic_id=None,
-        exclude_id=None, requester_id=None,
+        exclude_id=None, requester_id=None, chat_context=None,
     ):
         try:
             payload = {
@@ -1288,6 +1310,8 @@ class ClaudeAsk(loader.Module):
                 payload["message_id"] = exclude_id
             if requester_id is not None:
                 payload["requester_id"] = requester_id
+            if chat_context:
+                payload["chat_context"] = chat_context
             data = json.dumps(payload).encode()
             with self._relay_open(urllib.request.Request(
                     f"{BACKEND_URL}/ask", data=data,
@@ -2277,6 +2301,10 @@ class ClaudeAsk(loader.Module):
             # other participant would burn a full agentic call and pollute
             # the resumed session's context with irrelevant noise.
             "only_senders": [str(s) for s in (only_senders or [])],
+            # An agent/reply trigger normally sees just the message that
+            # matched. Opting in supplies the same fresh chat context as an
+            # interactive .ask without advancing its history cursor.
+            "include_chat_context": bool(spec.get("include_chat_context")),
             # action=confirm only: extra people (id or @username) allowed to
             # press THIS trigger's Удалить/Оставить buttons, on top of the
             # owner (always) and -- if target routed the card externally --
@@ -2751,11 +2779,16 @@ class ClaudeAsk(loader.Module):
         # against repeats of themselves.
         async with self._agent_trigger_lock(message.chat_id):
             self._agent_turn_sent[str(message.chat_id)] = False
+            chat_context = (
+                await self._build_trigger_chat_context(message)
+                if trig.get("include_chat_context") else None
+            )
             req_id = str(uuid.uuid4())
             enqueued, _ = await self._enqueue_async(
                 question, message.chat_id, req_id, "chat",
                 topic_id=self._topic_of(message),
                 requester_id=self._trigger_requester_id(trig, message),
+                chat_context=chat_context,
             )
             if not enqueued:
                 # The sibling backend may still use the legacy owner
@@ -2960,11 +2993,16 @@ class ClaudeAsk(loader.Module):
         # access, e.g. bridge.py's persistent-process migration notes).
         async with self._agent_trigger_lock(message.chat_id):
             self._agent_turn_sent[str(message.chat_id)] = False
+            chat_context = (
+                await self._build_trigger_chat_context(message)
+                if trig.get("include_chat_context") else None
+            )
             req_id = str(uuid.uuid4())
             enqueued, _ = await self._enqueue_async(
                 prompt, message.chat_id, req_id, "chat",
                 topic_id=self._topic_of(message),
                 requester_id=self._trigger_requester_id(trig, message),
+                chat_context=chat_context,
             )
             if not enqueued:
                 # The sibling backend may still use the legacy owner

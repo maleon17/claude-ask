@@ -646,7 +646,7 @@ def run_claude_streaming(
 def call_llm(
     question: str, chat_id: str, mode: str, req_id: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
-    owner_authorized: bool = False,
+    owner_authorized: bool = False, chat_context: str = None,
 ):
     if mode == "chat":
         system = load_persona(instance_id)
@@ -675,8 +675,12 @@ def call_llm(
 
     model = CLASSIFY_MODEL if mode == "classify" else None
     mcp_config = MCP_CONFIG_PATH if mode == "chat" else None
+    prompt = (
+        f"Контекст текущего чата:\n{chat_context.strip()}\n\nЗапрос пользователя:\n{question}"
+        if chat_context and chat_context.strip() else question
+    )
     answer, thoughts, new_session_id = run_claude_streaming(
-        system, question, on_progress, session_id=session_id, config_dir=_config_dir(instance_id), model=model,
+        system, prompt, on_progress, session_id=session_id, config_dir=_config_dir(instance_id), model=model,
         mcp_config=mcp_config, chat_id=chat_id, instance_id=instance_id,
         topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id, request_id=req_id,
     )
@@ -720,7 +724,7 @@ def _atomic_json(path, data):
 def _process_request(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
-    owner_authorized: bool = False,
+    owner_authorized: bool = False, chat_context: str = None,
 ):
     result_path = os.path.join(RESULT_DIR, f"{req_id}.json")
     with _CONCURRENCY:
@@ -729,6 +733,7 @@ def _process_request(
             answer, thoughts = call_llm(
                 question, chat_id, mode, req_id, instance_id, topic_id=topic_id,
                 exclude_id=exclude_id, requester_id=requester_id, owner_authorized=owner_authorized,
+                chat_context=chat_context,
             )
             print(f"  A: {answer[:80]}...", flush=True)
             _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": answer, "thoughts": thoughts})
@@ -743,16 +748,16 @@ def _process_request(
 def _process_request_serialized(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
-    owner_authorized: bool = False,
+    owner_authorized: bool = False, chat_context: str = None,
 ):
     # Stateless utility modes share no resumable session and stay parallel.
     if mode != "chat":
         return _process_request(
-            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized,
+            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized, chat_context,
         )
     with _chat_request_lock(instance_id, chat_id):
         return _process_request(
-            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized,
+            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized, chat_context,
         )
 
 
@@ -773,7 +778,7 @@ def main():
                     _process_request_serialized(
                         req_id, data["question"], data.get("chat_id", "unknown"), data.get("mode", "chat"),
                         data.get("instance_id") or DEFAULT_INSTANCE, data.get("topic_id"), data.get("message_id"),
-                        data.get("requester_id"), data.get("owner_authorized", False),
+                        data.get("requester_id"), data.get("owner_authorized", False), data.get("chat_context"),
                     )
             except Exception as exc:
                 req_id = os.path.basename(processing).split(".json", 1)[0]

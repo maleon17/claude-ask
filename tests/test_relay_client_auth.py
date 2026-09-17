@@ -1,6 +1,17 @@
 import asyncio
+import json
+import sys
+import types
 from unittest.mock import patch
 
+# The queue encryption dependency is not installed in the isolated test venv;
+# this test only exercises prompt composition, not encryption.
+crypto = types.ModuleType("cryptography.fernet")
+crypto.Fernet = object
+crypto.InvalidToken = Exception
+sys.modules.setdefault("cryptography", types.ModuleType("cryptography"))
+sys.modules.setdefault("cryptography.fernet", crypto)
+import claude_watcher
 from test_trigger_authorization import claude_ask, make_module
 
 
@@ -24,6 +35,34 @@ def test_client_enqueues_with_bearer_token(monkeypatch):
 
     assert bot._enqueue("question", "7", "request-7")[0]
     assert captured[0].get_header("Authorization") == "Bearer client-secret"
+
+
+def test_trigger_context_crosses_the_relay(monkeypatch):
+    bot = make_module()
+    captured = []
+    monkeypatch.setattr(bot, "_relay_open", lambda request, *_: captured.append(request) or _Response())
+
+    assert bot._enqueue("trigger question", "7", "request-7", chat_context="recent messages")[0]
+    assert json.loads(captured[0].data)["chat_context"] == "recent messages"
+
+
+def test_watcher_places_trigger_context_before_the_request(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(claude_watcher, "load_persona", lambda _: "persona")
+    monkeypatch.setattr(claude_watcher, "get_session_id", lambda *_: "thread")
+    monkeypatch.setattr(claude_watcher, "set_session_id", lambda *_: None)
+
+    def run(system, prompt, on_progress, **kwargs):
+        captured.update(system=system, prompt=prompt, kwargs=kwargs)
+        return "answer", [], "thread"
+
+    monkeypatch.setattr(claude_watcher, "run_claude_streaming", run)
+    assert claude_watcher.call_llm(
+        "reply naturally", "7", "chat", "request-7", chat_context="[id=1]: hello"
+    ) == ("answer", [])
+    assert captured["prompt"] == (
+        "Контекст текущего чата:\n[id=1]: hello\n\nЗапрос пользователя:\nreply naturally"
+    )
 
 
 def test_upload_boundary_is_not_reused_from_payload(monkeypatch):
