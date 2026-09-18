@@ -420,6 +420,16 @@ class ClaudeAsk(loader.Module):
             expected += f"/{topic_id}"
         return target == expected
 
+    def _trigger_send_target_is_authorized(self, trig, target, chat_id, topic_id=None):
+        """Allow a trigger to send only to its source chat or to a fixed,
+        owner-authored list of numeric Telegram destinations."""
+        if self._trigger_target_is_current_chat(target, chat_id, topic_id):
+            return True
+        allowed = trig.get("allowed_send_targets")
+        if not isinstance(allowed, (list, tuple, set, frozenset)):
+            return False
+        return str(target or "").strip() in {str(value).strip() for value in allowed}
+
     @staticmethod
     def _trigger_allowed_tools(trig):
         allowed = trig.get("allowed_tools")
@@ -456,7 +466,9 @@ class ClaudeAsk(loader.Module):
             if tool in HISTORY_TOOLS:
                 return self._chat_arg_is_current(args.get("chat"), chat_id)
             if tool in TRIGGER_LOCAL_SEND_TOOLS:
-                return self._trigger_target_is_current_chat(args.get("target"), chat_id, topic_id)
+                return self._trigger_send_target_is_authorized(
+                    trig, args.get("target"), chat_id, topic_id,
+                )
             return True
 
         # Live tool calls carry this value from the relay's request manifest;
@@ -2312,6 +2324,21 @@ class ClaudeAsk(loader.Module):
                 if any(not isinstance(tool, str) or not tool.strip() for tool in raw_allowed_tools):
                     return None, "allowed_tools должен содержать непустые строки"
                 allowed_tools = list(dict.fromkeys(tool.strip() for tool in raw_allowed_tools))
+        allowed_send_targets = None
+        if "allowed_send_targets" in spec:
+            raw_targets = spec.get("allowed_send_targets")
+            if raw_targets is not None:
+                if isinstance(raw_targets, (str, int)):
+                    raw_targets = [raw_targets]
+                if not isinstance(raw_targets, (list, tuple, set, frozenset)):
+                    return None, "allowed_send_targets должен быть списком chat_id"
+                allowed_send_targets = []
+                for target in raw_targets:
+                    value = str(target).strip()
+                    if not re.fullmatch(r"-?\d+(?:/\d+)?", value):
+                        return None, "allowed_send_targets принимает только numeric chat_id[/topic_id]"
+                    if value not in allowed_send_targets:
+                        allowed_send_targets.append(value)
         trig = {
             "id": uuid.uuid4().hex[:8],
             "kind": kind,
@@ -2370,6 +2397,8 @@ class ClaudeAsk(loader.Module):
             trig["report_to"] = report_to
         if "allowed_tools" in spec:
             trig["allowed_tools"] = allowed_tools
+        if "allowed_send_targets" in spec:
+            trig["allowed_send_targets"] = allowed_send_targets
         return trig, None
 
     async def _register_trigger_action(self, chat_arg, specs, chat_id, anchor_msg_id=None):
@@ -3031,6 +3060,12 @@ class ClaudeAsk(loader.Module):
             "Если инструкция сводится к 'просто сообщи об этом' -- вызови разрешённый "
             "send_message на этот адрес, а не просто отвечай текстом без реального вызова тула."
         )
+        extra_targets = trig.get("allowed_send_targets") or []
+        if extra_targets:
+            prompt += (
+                " Помимо текущего чата send_message разрешён только в эти явно "
+                "разрешённые адреса: " + ", ".join(map(str, extra_targets)) + "."
+            )
         # Serializes against both repeat firings of THIS trigger and any
         # _fire_reply_via_agent firing on the same chat -- see that
         # function's comment. Without this, two messages landing close
@@ -3063,6 +3098,12 @@ class ClaudeAsk(loader.Module):
                 await self._notify_topic(
                     "moderation", f"⚠️ Триггер [{_h(trig.get('id', '?'))}] (agent) не дождался ответа.",
                 )
+                return
+            if self._agent_turn_sent.pop(str(message.chat_id), False):
+                # The requested Telegram side effect already happened. A
+                # trigger has no live placeholder to replace, so rendering
+                # the model's final acknowledgement would otherwise post
+                # the entire internal trigger prompt to report_to/origin.
                 return
             reporter = _HeadlessReporter(
             lambda text: self._reply_to_origin(
