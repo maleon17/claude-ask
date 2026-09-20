@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import threading
 import types
 from unittest.mock import patch
 
@@ -42,27 +43,69 @@ def test_trigger_context_crosses_the_relay(monkeypatch):
     captured = []
     monkeypatch.setattr(bot, "_relay_open", lambda request, *_: captured.append(request) or _Response())
 
-    assert bot._enqueue("trigger question", "7", "request-7", chat_context="recent messages")[0]
+    assert bot._enqueue(
+        "trigger question", "7", "request-7", chat_context="recent messages", session_chat_id="-1008",
+    )[0]
     assert json.loads(captured[0].data)["chat_context"] == "recent messages"
+    assert json.loads(captured[0].data)["session_chat_id"] == "-1008"
 
 
 def test_watcher_places_trigger_context_before_the_request(monkeypatch):
     captured = {}
     monkeypatch.setattr(claude_watcher, "load_persona", lambda _: "persona")
-    monkeypatch.setattr(claude_watcher, "get_session_id", lambda *_: "thread")
-    monkeypatch.setattr(claude_watcher, "set_session_id", lambda *_: None)
+    get_session_id = patch.object(claude_watcher, "get_session_id", return_value="thread")
+    set_session_id = patch.object(claude_watcher, "set_session_id")
 
     def run(system, prompt, on_progress, **kwargs):
         captured.update(system=system, prompt=prompt, kwargs=kwargs)
         return "answer", [], "thread"
 
     monkeypatch.setattr(claude_watcher, "run_claude_streaming", run)
-    assert claude_watcher.call_llm(
-        "reply naturally", "7", "chat", "request-7", chat_context="[id=1]: hello"
-    ) == ("answer", [])
+    with get_session_id as get_session, set_session_id as set_session:
+        assert claude_watcher.call_llm(
+            "reply naturally", "-100watched", "chat", "request-7",
+            chat_context="[id=1]: hello", session_chat_id="-100owner",
+        ) == ("answer", [])
+    get_session.assert_called_once_with(claude_watcher.DEFAULT_INSTANCE, "-100owner")
+    set_session.assert_called_once_with(claude_watcher.DEFAULT_INSTANCE, "-100owner", "thread")
     assert captured["prompt"] == (
         "Контекст текущего чата:\n[id=1]: hello\n\nЗапрос пользователя:\nreply naturally"
     )
+    assert captured["kwargs"]["chat_id"] == "-100watched"
+
+
+def test_watcher_serializes_requests_sharing_a_session_chat_id(monkeypatch):
+    """Different observed chats must not concurrently resume one owner session."""
+    first_started = threading.Event()
+    release = threading.Event()
+    entered = []
+
+    def process(*_args):
+        entered.append(True)
+        if len(entered) == 1:
+            first_started.set()
+            assert release.wait(2)
+
+    monkeypatch.setattr(claude_watcher, "_process_request", process)
+    first = threading.Thread(
+        target=claude_watcher._process_request_serialized,
+        args=("first", "question", "-100watched-a", "chat"),
+        kwargs={"session_chat_id": "-100owner"},
+    )
+    second = threading.Thread(
+        target=claude_watcher._process_request_serialized,
+        args=("second", "question", "-100watched-b", "chat"),
+        kwargs={"session_chat_id": "-100owner"},
+    )
+    first.start()
+    assert first_started.wait(1)
+    second.start()
+    second.join(0.1)
+    assert entered == [True]
+    release.set()
+    first.join(2)
+    second.join(2)
+    assert entered == [True, True]
 
 
 def test_upload_boundary_is_not_reused_from_payload(monkeypatch):

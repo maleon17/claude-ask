@@ -122,6 +122,32 @@ def test_relay_requires_bearer_and_scopes_instance_resources(tmp_path):
         ) == 403
 
 
+def test_relay_sanitizes_trigger_context_and_session_chat_id(tmp_path):
+    """/ask preserves only valid trigger fields through the real relay."""
+    with relay_server(tmp_path) as (relay, base, token_a, _):
+        tail = "fresh context tail"
+        context = "old context " * 25000 + tail
+        valid = json.dumps({
+            "request_id": "trigger-valid", "question": "reply", "instance_id": "andrey",
+            "chat_context": context, "session_chat_id": "-1009876543210",
+        }).encode()
+        assert _status(f"{base}/ask", token=token_a, data=valid) == 200
+        queued = json.loads((Path(relay.ASK_QUEUE_DIR) / "trigger-valid.json").read_text())
+        assert queued["session_chat_id"] == "-1009876543210"
+        assert queued["chat_context"].startswith("[контекст обрезан]")
+        assert queued["chat_context"].endswith(tail)
+        assert len(queued["chat_context"]) == 200000
+
+        invalid = json.dumps({
+            "request_id": "trigger-invalid", "question": "reply", "instance_id": "andrey",
+            "chat_context": ["not a string"], "session_chat_id": "owner-chat",
+        }).encode()
+        assert _status(f"{base}/ask", token=token_a, data=invalid) == 200
+        queued = json.loads((Path(relay.ASK_QUEUE_DIR) / "trigger-invalid.json").read_text())
+        assert "chat_context" not in queued
+        assert "session_chat_id" not in queued
+
+
 def test_relay_configuration_rejects_missing_or_empty_token_file(monkeypatch, tmp_path):
     """S01: the service cannot accidentally start in unauthenticated mode."""
     relay = _load_relay()

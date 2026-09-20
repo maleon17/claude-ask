@@ -1,6 +1,7 @@
 """Regression tests for the Ask UI transport; no Telegram or relay required."""
 import asyncio
 import json
+import re
 from unittest.mock import AsyncMock
 
 from test_trigger_authorization import claude_ask, make_module
@@ -174,3 +175,77 @@ def test_format_messages_marks_which_message_a_reply_answers():
     assert "id=10" in lines[0] and "реплай" not in lines[0]
     assert "id=11" in lines[1] and "реплай" not in lines[1]
     assert "id=12" in lines[2] and "реплай на id=10" in lines[2]
+
+
+class HistoryClient:
+    """Small in-memory stand-in for get_messages' two cursor modes."""
+
+    def __init__(self, messages):
+        self.messages = messages
+
+    async def download_file(self, *_args):
+        # A missing download exercises real media prefetch without making the
+        # test depend on the upload relay.
+        return None
+
+    async def get_messages(self, _chat_id, *, limit, offset_id=None, min_id=None,
+                           reverse=False, max_id=None, **_kwargs):
+        if offset_id is not None:
+            before = [m for m in self.messages if m.id < offset_id]
+            return list(reversed(before[-limit:]))
+        after = [m for m in self.messages if m.id > min_id]
+        if max_id is not None:
+            after = [m for m in after if m.id < max_id]
+        return after[:limit] if reverse else list(reversed(after[-limit:]))
+
+
+class MediaHistoryMsg(HistoryMsg):
+    def __init__(self, msg_id):
+        super().__init__(msg_id, f"message {msg_id}", sender_id=None)
+        self.photo = object()
+
+
+def _displayed_history_ids(text):
+    return [int(value) for value in re.findall(r"\[id=(\d+)", text)]
+
+
+def _history_continuation(text):
+    match = re.search(
+        r'read_history\(count=(\d+), direction="(after|before)", '
+        r'reply_id=(\d+), until_id=(\d+)\)',
+        text,
+    )
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(3)), int(match.group(4)), match.group(2)
+
+
+def test_before_history_page_continuations_cover_the_full_range_in_order():
+    """A truncated `before` range must continue toward its original upper bound.
+
+    This runs _read_history_action/_render_history_page unchanged and follows
+    each continuation emitted by the real page renderer. Every message is
+    media, so truncation uses the actual HISTORY_MEDIA_BATCH_SIZE, not a test
+    override.
+    """
+    bot = make_module()
+    messages = [
+        MediaHistoryMsg(i)
+        for i in range(1, bot.HISTORY_MEDIA_BATCH_SIZE * 2 + 2)
+    ]
+    bot._client = HistoryClient(messages)
+
+    page = run(bot._read_history_action(
+        1, cnt=len(messages), direction="before", reply_id=len(messages) + 1,
+    ))
+    seen = _displayed_history_ids(page)
+
+    while continuation := _history_continuation(page):
+        count, reply_id, until_id, direction = continuation
+        assert direction == "after"
+        page = run(bot._read_history_action(
+            1, cnt=count, direction=direction, reply_id=reply_id, until_id=until_id,
+        ))
+        seen.extend(_displayed_history_ids(page))
+
+    assert seen == list(range(1, len(messages) + 1))

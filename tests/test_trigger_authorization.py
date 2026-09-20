@@ -170,7 +170,7 @@ def trigger(trigger_id="trigger-1", **extra):
 @pytest.mark.parametrize("action", ["agent", "reply"])
 def test_trigger_agent_and_reply_enqueue_non_owner_context(monkeypatch, action):
     """Regression: old code put OWNER_ID into both autonomous queue requests."""
-    trig = trigger()
+    trig = trigger(registration_chat_id=OTHER_CHAT_ID)
     bot = make_module({CURRENT_CHAT_ID: [trig]})
     message = FakeMessage()
     bot._enqueue = Mock(return_value=True)
@@ -193,6 +193,15 @@ def test_trigger_agent_and_reply_enqueue_non_owner_context(monkeypatch, action):
     assert requester_id != OWNER_ID
     assert not requester_id.isdigit()
     assert kwargs["chat_context"] == "fresh trigger history"
+    assert kwargs["session_chat_id"] == OTHER_CHAT_ID
+
+    for registration_chat_id in ("", CURRENT_CHAT_ID):
+        bot._enqueue.reset_mock()
+        run_async(bot._fire_agent_action(
+            trigger(registration_chat_id=registration_chat_id), FakeMessage(), "watched chat", "attacker",
+            allow_fallback=False,
+        ))
+        assert "session_chat_id" not in bot._enqueue.call_args.kwargs
 
 
 def test_reply_trigger_does_not_duplicate_successful_send_message(monkeypatch):

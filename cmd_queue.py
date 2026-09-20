@@ -594,6 +594,16 @@ class Queue(BaseHTTPRequestHandler):
             ):
                 if k in body:
                     ask_data[k] = body[k]
+            chat_context = body.get("chat_context")
+            if isinstance(chat_context, str):
+                max_context_len = 200000
+                if len(chat_context) > max_context_len:
+                    truncated_marker = "[контекст обрезан]\n"
+                    chat_context = truncated_marker + chat_context[-(max_context_len - len(truncated_marker)):]
+                ask_data["chat_context"] = chat_context
+            session_chat_id = body.get("session_chat_id")
+            if isinstance(session_chat_id, str) and re.fullmatch(r"-?\d+", session_chat_id):
+                ask_data["session_chat_id"] = session_chat_id
             ask_data["instance_id"] = instance_id
             if existing:
                 self._json({"status": "accepted", "request_id": req_id})

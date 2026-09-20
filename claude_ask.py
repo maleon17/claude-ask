@@ -1021,7 +1021,11 @@ class ClaudeAsk(loader.Module):
         return selected
 
     async def _prefetch_history_media(self, messages):
-        """Fetch a page's media concurrently, retaining message order in caller."""
+        """Fetch a page's media with concurrency capped by its media-batch size.
+
+        A batch size of one is deliberately sequential; the caller retains
+        message order regardless of I/O completion order.
+        """
         semaphore = asyncio.Semaphore(self.HISTORY_MEDIA_BATCH_SIZE)
 
         async def fetch(message, kind):
@@ -1073,9 +1077,10 @@ class ClaudeAsk(loader.Module):
         a call whose entire point is reading specific messages in full."""
         if name_cache is None:
             name_cache = {}
-        # All actual downloads/transcriptions for this already-bounded page
-        # run together. Formatting below still walks the messages in their
-        # original order, so concurrent I/O cannot scramble the dialogue.
+        # Downloads/transcriptions for this already-bounded page use at most
+        # its media-batch size concurrently (and are sequential at size one).
+        # Formatting below still walks messages in original order, so I/O
+        # completion order cannot scramble the dialogue.
         media = await self._prefetch_history_media(msgs)
         lines = []
         for m in msgs:
@@ -1347,7 +1352,7 @@ class ClaudeAsk(loader.Module):
 
     def _enqueue(
         self, question, chat_id, req_id, mode="chat", topic_id=None,
-        exclude_id=None, requester_id=None, chat_context=None,
+        exclude_id=None, requester_id=None, chat_context=None, session_chat_id=None,
     ):
         try:
             payload = {
@@ -1369,6 +1374,8 @@ class ClaudeAsk(loader.Module):
                 payload["requester_id"] = requester_id
             if chat_context:
                 payload["chat_context"] = chat_context
+            if session_chat_id is not None:
+                payload["session_chat_id"] = session_chat_id
             data = json.dumps(payload).encode()
             with self._relay_open(urllib.request.Request(
                     f"{BACKEND_URL}/ask", data=data,
@@ -2557,7 +2564,7 @@ class ClaudeAsk(loader.Module):
                 chat_label = label_cache[cid_int]
             line = f"- id={t['id']}, [{t.get('engine', 'claude')}] чат «{chat_label}», {t['kind']} → {t['action']}: {t.get('label', '')}"
             if t.get("action") == "agent":
-                line += f"\n  отчёт: {t.get('report_to', 'origin')}"
+                line += f"\n  отчёт: {t.get('report_to', 'notify')}"
             if t.get("kind") in ("keyword", "link") and t.get("value"):
                 values = t["value"] if isinstance(t["value"], list) else [t["value"]]
                 line += "\n  слова: " + ", ".join(map(str, values))
@@ -2841,11 +2848,17 @@ class ClaudeAsk(loader.Module):
                 if trig.get("include_chat_context") else (None, None)
             )
             req_id = str(uuid.uuid4())
+            session_chat_id = str(trig.get("registration_chat_id") or "").strip()
+            enqueue_kwargs = {
+                "topic_id": self._topic_of(message),
+                "requester_id": self._trigger_requester_id(trig, message),
+                "chat_context": chat_context,
+            }
+            if session_chat_id and session_chat_id != str(message.chat_id):
+                enqueue_kwargs["session_chat_id"] = session_chat_id
             enqueued, _ = await self._enqueue_async(
                 question, message.chat_id, req_id, "chat",
-                topic_id=self._topic_of(message),
-                requester_id=self._trigger_requester_id(trig, message),
-                chat_context=chat_context,
+                **enqueue_kwargs,
             )
             if not enqueued:
                 # The sibling backend may still use the legacy owner
@@ -3062,11 +3075,16 @@ class ClaudeAsk(loader.Module):
                 if trig.get("include_chat_context") else (None, None)
             )
             req_id = str(uuid.uuid4())
+            enqueue_kwargs = {
+                "topic_id": self._topic_of(message),
+                "requester_id": self._trigger_requester_id(trig, message),
+                "chat_context": chat_context,
+            }
+            if origin_chat and origin_chat != str(message.chat_id):
+                enqueue_kwargs["session_chat_id"] = origin_chat
             enqueued, _ = await self._enqueue_async(
                 prompt, message.chat_id, req_id, "chat",
-                topic_id=self._topic_of(message),
-                requester_id=self._trigger_requester_id(trig, message),
-                chat_context=chat_context,
+                **enqueue_kwargs,
             )
             if not enqueued:
                 # The sibling backend may still use the legacy owner
@@ -3770,16 +3788,10 @@ class ClaudeAsk(loader.Module):
             return f"{heading}:\n\n{history}"
 
         remaining = len(ordered) - len(page)
-        if direction == "before":
-            continuation = (
-                f'read_history(count={remaining}, direction="before", '
-                f'reply_id={page[0].id})'
-            )
-        else:
-            continuation = (
-                f'read_history(count={remaining}, direction="after", '
-                f'reply_id={page[-1].id}, until_id={until_id or ordered[-1].id})'
-            )
+        continuation = (
+            f'read_history(count={remaining}, direction="after", '
+            f'reply_id={page[-1].id}, until_id={until_id or ordered[-1].id})'
+        )
         return (
             f"{heading}; показана часть {len(page)} из {len(ordered)}:\n\n{history}\n\n"
             "[ИСТОРИЯ ЕЩЁ НЕ ПРОЧИТАНА. Немедленно вызови "

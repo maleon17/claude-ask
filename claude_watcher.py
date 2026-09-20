@@ -646,7 +646,7 @@ def run_claude_streaming(
 def call_llm(
     question: str, chat_id: str, mode: str, req_id: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
-    owner_authorized: bool = False, chat_context: str = None,
+    owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
 ):
     if mode == "chat":
         system = load_persona(instance_id)
@@ -658,7 +658,8 @@ def call_llm(
     # Only "chat" (plain .ask) is a real ongoing conversation worth resuming.
     # "search"/"translate" are one-off utility calls -- keep them stateless
     # so they never touch or fork the main chat session.
-    session_id = get_session_id(instance_id, chat_id) if mode == "chat" else None
+    session_key_chat = session_chat_id or chat_id
+    session_id = get_session_id(instance_id, session_key_chat) if mode == "chat" else None
 
     last_write = [0.0]
 
@@ -686,7 +687,7 @@ def call_llm(
     )
 
     if mode == "chat" and new_session_id:
-        set_session_id(instance_id, chat_id, new_session_id)
+        set_session_id(instance_id, session_key_chat, new_session_id)
 
     return answer, thoughts
 
@@ -724,7 +725,7 @@ def _atomic_json(path, data):
 def _process_request(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
-    owner_authorized: bool = False, chat_context: str = None,
+    owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
 ):
     result_path = os.path.join(RESULT_DIR, f"{req_id}.json")
     with _CONCURRENCY:
@@ -733,7 +734,7 @@ def _process_request(
             answer, thoughts = call_llm(
                 question, chat_id, mode, req_id, instance_id, topic_id=topic_id,
                 exclude_id=exclude_id, requester_id=requester_id, owner_authorized=owner_authorized,
-                chat_context=chat_context,
+                chat_context=chat_context, session_chat_id=session_chat_id,
             )
             print(f"  A: {answer[:80]}...", flush=True)
             _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": answer, "thoughts": thoughts})
@@ -748,16 +749,19 @@ def _process_request(
 def _process_request_serialized(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
-    owner_authorized: bool = False, chat_context: str = None,
+    owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
 ):
     # Stateless utility modes share no resumable session and stay parallel.
     if mode != "chat":
         return _process_request(
-            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized, chat_context,
+            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
+            owner_authorized, chat_context, session_chat_id,
         )
-    with _chat_request_lock(instance_id, chat_id):
+    session_key_chat = session_chat_id or chat_id
+    with _chat_request_lock(instance_id, session_key_chat):
         return _process_request(
-            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id, owner_authorized, chat_context,
+            req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
+            owner_authorized, chat_context, session_chat_id,
         )
 
 
@@ -779,6 +783,7 @@ def main():
                         req_id, data["question"], data.get("chat_id", "unknown"), data.get("mode", "chat"),
                         data.get("instance_id") or DEFAULT_INSTANCE, data.get("topic_id"), data.get("message_id"),
                         data.get("requester_id"), data.get("owner_authorized", False), data.get("chat_context"),
+                        data.get("session_chat_id"),
                     )
             except Exception as exc:
                 req_id = os.path.basename(processing).split(".json", 1)[0]
