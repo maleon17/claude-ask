@@ -143,10 +143,26 @@ TOOL_PERMISSION_DENIAL = (
 # docs 2026-08-05, not guessed: POST multipart/form-data, model
 # voxtral-mini-latest, response JSON's "text" field holds the transcript.
 # No hardcoded default on purpose (this repo is a public git remote, unlike
-# ~/.claude-telegram-bridge/jarvis-ask/) -- set the real key via env var, or
-# patch this line locally without committing it, before (re)deploying via .lm.
-# Real key: see BRIDGE_PROJECT_HANDOFF.md's Mistral/Voxtral section.
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
+# ~/.claude-telegram-bridge/jarvis-ask/). A plain env var does not survive a
+# cold container restart on the Heroku-userbot host -- the loader re-fetches
+# this module fresh from its GitHub source on every cold boot, and the env
+# var itself is only ever set once at container creation by the hosting
+# panel, so any manual re-export is gone by the next one. /data/ on that
+# host is the one bind-mounted, persistent volume (confirmed in
+# BRIDGE_PROJECT_HANDOFF.md's Tailscale section) -- read the real key from a
+# file there first, so it survives both a module re-fetch AND a full
+# container reinstall. Real key: see BRIDGE_PROJECT_HANDOFF.md's
+# Mistral/Voxtral section.
+def _load_mistral_api_key():
+    try:
+        with open("/data/mistral_api_key.txt", encoding="utf-8") as handle:
+            key = handle.read().strip()
+    except FileNotFoundError:
+        key = ""
+    return key or os.environ.get("MISTRAL_API_KEY", "")
+
+
+MISTRAL_API_KEY = _load_mistral_api_key()
 MISTRAL_TRANSCRIBE_URL = "https://api.mistral.ai/v1/audio/transcriptions"
 
 TEXT_EXTS = {
