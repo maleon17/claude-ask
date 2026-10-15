@@ -1,53 +1,65 @@
-# claude-ask
+# ClaudeAsk
 
-> Part of **[telegram-ai](https://github.com/maleon17/telegram-ai)** — Claude/Codex ↔ Telegram, four ways.
+> Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude/Codex from dedicated bots or directly inside your Telegram account.
 
-A Telegram userbot/backend for ClaudeAsk. It lets the owner
-invoke Jarvis with the `.ask` command in any Telegram chat and perform real
-actions through their own Telethon session. This is not the Bot API bridge
-and not codex-ask.
+**Invoke Claude from an ordinary Telegram conversation, as your own account.**
 
-Repository: <https://github.com/maleon17/claude-ask>
+ClaudeAsk combines a Telethon/Hikka userbot with a Claude Code worker and resumable per-chat sessions. Type `.ask` in a chat, the backend does the work, and the loaded module can use your live Telegram session for real actions such as reading history, searching chats, sending files or managing supported conversation workflows.
 
-## Components
+This is deliberately different from **[claude-telegram-bridge](https://github.com/maleon17/claude-telegram-bridge)**: there is no separate bot conversation acting as the UI. ClaudeAsk lives inside the conversations you already use.
 
-- `claude_ask.py` — the main loadable ClaudeAsk module;
-- `claude_watcher.py` — the Claude Code backend with persistent sessions;
-- `mcp_telegram_tools.py` — launcher for the required CodexAsk MCP implementation;
-- `cmd_queue.py` — the shared HTTP queue relay for `.ask` and `.xask`;
-- `setup.sh` and service examples — backend infrastructure setup.
+## How it works
+
+```mermaid
+flowchart LR
+    C["Telegram chat<br/>.ask"] --> U["ClaudeAsk<br/>Telethon module"]
+    U --> R["Authenticated<br/>queue relay"]
+    R --> W["Claude Code worker<br/>resumable sessions"]
+    W --> R --> U
+    W --> M["Telegram actions MCP"]
+    M --> R --> U
+    U <--> T["Live Telethon session"]
+```
+
+The important trust boundary is intentional: **the backend does not own your Telegram account**. Telegram actions are queued back to the module that holds the live Telethon session. The action gets a real result before the agent can treat it as completed.
+
+The module submits `.ask` work to the relay's `/ask` endpoint. The worker returns progress and answers through `/tmp/jarvisask_ask_*`; MCP action calls use `/tmp/jarvisask_tool_queue` before the userbot executes them.
+
+## What is included
+
+- `claude_ask.py` — loadable ClaudeAsk userbot module
+- `claude_watcher.py` — Claude Code backend with resumable sessions
+- `mcp_telegram_tools.py` — launcher for the Telegram-action MCP implementation from the CodexAsk checkout
+- `cmd_queue.py` — authenticated shared HTTP queue relay
+- `setup.sh` and service examples — backend installation
 
 ## Commands
 
-ClaudeAsk uses `.ask`, `.search`, `.translate`, and `.new`. Triggers are
-stored in the `ClaudeAsk` namespace. CodexAsk uses a separate history
-namespace and `x`-prefixed commands, but deliberately reads the same trigger
-namespace; the incoming-message watcher stays a single one, so triggers
-aren't duplicated.
+ClaudeAsk provides:
 
-## Architecture
+- `.ask` — ask Claude
+- `.search` — search workflow
+- `.translate` — translation workflow
+- `.new` — reset/start a fresh Claude context
 
-The userbot module sends a request to `/ask`, the worker processes it
-through Claude Code and returns a progress/answer stream via
-`/tmp/jarvisask_ask_*`. MCP calls land in `/tmp/jarvisask_tool_queue`; the module
-holding a live Telethon session executes the action and returns the result.
-Every action gets a real tool result first, and only then is it reflected
-in the reply to the user.
+Network configuration is stored per userbot instance through `.asknet`.
 
-The queue relay is shared infrastructure transport. If
-`jarvis-ask-cmd-queue.service` is already running on the host, don't start a
-second copy on the same ports/directories.
+Trigger rules live in the shared `ClaudeAsk` namespace, enabling coordination when both products and the optional `jarvis_ask.py` coordinator are loaded.
 
 ## Backend installation
 
-Requirements: Linux, Python 3.10+, the Claude Code CLI authenticated via
-`claude auth login --claudeai`, systemd (for running as a service). The
-userbot itself must be installed separately — this project targets the
-[Heroku](https://github.com/coddrago/Heroku) userbot; follow its own README
-for installing and starting the userbot before loading `claude_ask.py` into
-it. Heroku can run on a dedicated Telethon/Hikka host or in Docker on the
-same machine as this backend — running it on a separate host is just this
-deployment's own choice, not a requirement.
+Requirements:
+
+- Linux with Python 3.10+
+- Claude Code CLI authenticated with `claude auth login --claudeai`
+- `systemd`
+- a supported Telethon/Hikka userbot; this project targets [Heroku](https://github.com/coddrago/Heroku)
+
+Heroku may run on the same host or in Docker on a separate host; the latter is a deployment choice, not a requirement.
+
+Install and start the userbot using Heroku's own instructions before loading `claude_ask.py`.
+
+Install the backend:
 
 ```bash
 git clone https://github.com/maleon17/claude-ask.git
@@ -56,54 +68,85 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-ClaudeAsk depends on the CodexAsk checkout's `telegram_actions_mcp.py`; setup
-asks for that path (or uses `JARVIS_TELEGRAM_MCP_PATH`) and validates it. The
-script creates the MCP virtualenv, a local
-`mcp_telegram_tools_config.json`, and a runtime directory. Service templates
-need `__USER__` and `__INSTALL_DIR__` replaced; the queue relay should only
-be installed once per host.
+ClaudeAsk currently uses the CodexAsk checkout's `telegram_actions_mcp.py`; `setup.sh` asks for that path or reads `JARVIS_TELEGRAM_MCP_PATH`.
 
-## Loading the module
+The installer creates the MCP virtual environment, `mcp_telegram_tools_config.json` and a runtime directory. Replace `__USER__` and `__INSTALL_DIR__` in the service templates before enabling them.
 
-Send the same `claude_ask.py` as a document to each userbot instance's
-dedicated test Telegram channel and reply to the document with `.lm`. Then,
-once per account, run `.asknet token <token>` and `.asknet local <instance_id>` or
-`.asknet tailnet <instance_id> <backend_url>`. Settings persist across later
-updates via `.dlm`. After loading, verify `.ask`, `.new`, and a request that
-uses a real tool (`list_triggers`, `read_history`, or `search_chat`).
+The queue relay is shared infrastructure. If `jarvis-ask-cmd-queue.service` is already running for the same deployment, do not launch a second copy on the same ports/directories.
 
-The queue relay's network address and the Mistral key for voice
-transcription are set via environment variables
-(`CLAUDE_JARVIS_BACKEND_URL`, `MISTRAL_API_KEY`); no secrets are stored in
-the repository.
+## Load the userbot module
 
-## Relay authentication
+Send `claude_ask.py` as a document to the userbot's test channel and reply with:
 
-The relay refuses to start unless `JARVIS_RELAY_TOKENS_FILE` contains a
-non-empty JSON map of `sha256(token)` to `instance_id`, and
-`JARVIS_RELAY_OWNERS_FILE` contains the corresponding server-side map of
-`instance_id` to Telegram owner ID. Store both files outside the checkout,
-mode `0600`. Generate an entry (the raw token is printed once only):
+```text
+.lm
+```
+
+Configure the instance once:
+
+```text
+.asknet token <token>
+.asknet local <instance_id>
+```
+
+or, for a remote backend:
+
+```text
+.asknet tailnet <instance_id> <backend_url>
+```
+
+The saved network settings survive later module updates.
+
+Verify `.ask`, `.new`, and at least one request that uses a real Telegram tool such as `list_triggers`, `read_history`, or `search_chat`.
+
+## Relay authentication and trust boundary
+
+The relay requires:
+
+- `JARVIS_RELAY_TOKENS_FILE`: server-side mapping of `sha256(token)` to `instance_id`
+- `JARVIS_RELAY_OWNERS_FILE`: server-side mapping of `instance_id` to Telegram owner ID
+
+Both should live outside the checkout with mode `0600`.
+
+Generate a token entry with:
 
 ```bash
 JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json \
   python3 cmd_queue.py --add-token <instance_id>
 ```
 
-Set `JARVIS_RELAY_BIND` to a comma-separated list of listen addresses; its
-safe default is `127.0.0.1`. Set `JARVIS_RELAY_TOKEN` for a one-instance
-local watcher/MCP or `JARVIS_RELAY_TOKENS_JSON` as a JSON instance-to-token
-map when one watcher serves several instances. Remote userbots save their own token with
-`.asknet token <token>`; the command only reports that it is configured.
+The raw token is shown once. Remote userbots save it with `.asknet token <token>`; the command only reports whether a token is configured.
 
-The authenticated userbot reports `requester_id`; relay cannot independently
-verify the original Telegram sender. This is the explicit trust boundary.
-The relay nevertheless derives owner authorization on the server by comparing
-that value with the owner ID configured for the token's instance, and never
-accepts a client-provided owner flag. Requests, tool calls, results, personas,
-resets and registered download artifacts are all scoped to that instance.
+The authenticated userbot reports `requester_id`. The relay cannot independently prove the original Telegram sender, so the authenticated userbot remains an explicit trust boundary. Owner authorization is nevertheless derived server-side from the token's instance mapping; the client cannot simply claim to be the owner.
 
-## Verification and updates
+Requests, tools, results, personas, resets and registered download artifacts are scoped by instance.
+
+## Network configuration
+
+`JARVIS_RELAY_BIND` controls relay listen addresses and defaults safely to `127.0.0.1`.
+
+`CLAUDE_JARVIS_BACKEND_URL` configures the queue relay's network address for the module.
+
+Local watcher/MCP processes receive either:
+
+- `JARVIS_RELAY_TOKEN` for one instance, or
+- `JARVIS_RELAY_TOKENS_JSON` for an instance-to-token map.
+
+Do not store these secrets in the repository.
+
+Voice transcription reads its Mistral key first from `/data/mistral_api_key.txt`, then falls back to `MISTRAL_API_KEY` in the environment. Keep either source outside the repository.
+
+## Updating
+
+Reinstall the current module from `main` with:
+
+```text
+.dlm https://raw.githubusercontent.com/maleon17/claude-ask/main/claude_ask.py
+```
+
+A plain `docker cp` does not reload an already-running module. `.asknet` configuration persists in the userbot database.
+
+## Verification
 
 ```bash
 ./scripts/run_tests.sh
@@ -111,32 +154,15 @@ systemctl status jarvis-ask-watcher
 journalctl -u jarvis-ask-watcher -f
 ```
 
-A plain `docker cp` does not reload an already-running module.
+`requirements-dev.txt` declares pytest. CI runs the test suite without requiring secrets or live Telegram services.
 
-`requirements-dev.txt` declares pytest. CI runs the same test command without
-secrets or live services. ClaudeAsk has its own watcher; when CodexAsk and the
-optional `jarvis_ask.py` coordinator are loaded too, the coordinator chooses
-one trigger action per incoming message. Without it, each module keeps its
-separate legacy trigger behavior.
+## ClaudeAsk + CodexAsk
 
-## Updating
+ClaudeAsk and **[CodexAsk](https://github.com/maleon17/codex-ask)** are independent agent backends with separate histories, but intentionally share selected infrastructure and trigger coordination.
 
-The loaded module reinstalls itself in place from the latest version on
-`main`:
+When both modules and the optional `jarvis_ask.py` coordinator are loaded, it chooses one trigger action per incoming message. Without it, the modules retain their separate legacy trigger handling.
 
-```text
-.dlm https://raw.githubusercontent.com/maleon17/claude-ask/main/claude_ask.py
-```
-
-Each instance's saved `.asknet` configuration stays in Heroku's database, so
-there's no need to reconfigure the network after an update.
-
-## Product boundaries
-
-`Claude-jarvis` is ClaudeAsk/the userbot. `Codex-jarvis` is the independent
-CodexAsk and its app-server. `Codex-telegram-bot` is yet another independent
-Bot API frontend. Only the queue relay and the trigger namespace are
-deliberately shared.
+For the wider picture, see **[Telegram AI](https://github.com/maleon17/telegram-ai)**.
 
 ## License
 
