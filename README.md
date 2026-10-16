@@ -84,6 +84,8 @@ Send `claude_ask.py` as a document to the userbot's test channel and reply with:
 
 Configure the instance once:
 
+Choose `<instance_id>` yourself (for example, `mybot`). Generate `<token>` on the backend with `cmd_queue.py --add-token` as shown under [Relay authentication](#relay-authentication-and-trust-boundary). Use the same ID in both commands.
+
 ```text
 .asknet token <token>
 .asknet local <instance_id>
@@ -127,14 +129,14 @@ The relay requires:
 
 Both should live outside the checkout with mode `0600`.
 
-Generate a token entry with:
+For an instance named `mybot`, set `/etc/jarvis-ask/relay-owners.json` to `{"mybot": 123456789}` (or add this entry to the existing JSON object). Replace the number with your numeric Telegram user ID. Then generate its token on the backend host:
 
 ```bash
-JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json \
-  python3 cmd_queue.py --add-token <instance_id>
+sudo env JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json \
+  python3 cmd_queue.py --add-token mybot
 ```
 
-The raw token is shown once. Remote userbots save it with `.asknet token <token>`; the command only reports whether a token is configured.
+The token is printed once. Enter it with `.asknet token <token>`, then restart the relay to load the new token and owner mapping.
 
 The authenticated userbot reports `requester_id`. The relay cannot independently prove the original Telegram sender, so the authenticated userbot remains an explicit trust boundary. Owner authorization is nevertheless derived server-side from the token's instance mapping; the client cannot simply claim to be the owner.
 
