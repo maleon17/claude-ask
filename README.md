@@ -83,7 +83,7 @@ Send `claude_ask.py` as a document to the userbot's test channel and reply with:
 .lm
 ```
 
-Then run the `.asknet` command `setup.sh` printed for you (or, if you skipped instance setup, generate it manually first — see [Relay authentication](#relay-authentication-and-trust-boundary)):
+Then run `.asknet` with the exact `<token>` and `<instance_id>` `setup.sh` printed to your terminal a moment ago (or that `cmd_queue.py --add-token <instance_id>` printed, if you generated them by hand — see [Relay authentication](#relay-authentication-and-trust-boundary)). That token is shown once and stored nowhere else in plaintext; if you lost it, re-run `setup.sh` or `cmd_queue.py --add-token` again to mint a new one for the same instance:
 
 ```text
 .asknet token <token>
@@ -128,7 +128,7 @@ The relay requires:
 - `JARVIS_RELAY_TOKENS_FILE` (default `/etc/jarvis-ask/relay-tokens.json`): server-side mapping of `sha256(token)` to `instance_id`
 - `JARVIS_RELAY_OWNERS_FILE` (default `/etc/jarvis-ask/relay-owners.json`): server-side mapping of `instance_id` to Telegram owner ID
 
-Both live outside the checkout with mode `0600`. `setup.sh` registers the owner and generates the token for you (and restarts the relay so it takes effect); the token is printed once and never stored anywhere in plaintext. To add another instance later, re-run `setup.sh` — it reuses the already-running relay and watcher rather than reinstalling them. To do this by hand instead, see [Manual setup](#manual-setup-without-setupsh).
+Both live outside the checkout with mode `0600`. `setup.sh` registers the owner and generates the token for you (and restarts the relay so it takes effect), then writes `JARVIS_RELAY_TOKEN=<token>` into `/etc/jarvis-ask/relay-token.env` (mode `0600`), which the watcher's systemd unit reads via `EnvironmentFile=` to authenticate its local Telegram MCP client back to the relay. The raw token is printed to your terminal exactly once and stored nowhere else in plaintext — that's the `<token>` for `.asknet token` in [Load the userbot module](#load-the-userbot-module). To add another instance later, re-run `setup.sh` — it reuses the already-running relay and watcher rather than reinstalling them (for a second instance on the same watcher, it prints the new token separately and asks you to combine both into `JARVIS_RELAY_TOKENS_JSON` yourself — an instance_id → token JSON map — instead of the single-instance `JARVIS_RELAY_TOKEN`). To do any of this by hand instead, see [Manual setup](#manual-setup-without-setupsh).
 
 The authenticated userbot reports `requester_id`. The relay cannot independently prove the original Telegram sender, so the authenticated userbot remains an explicit trust boundary. Owner authorization is nevertheless derived server-side from the token's instance mapping; the client cannot simply claim to be the owner.
 
@@ -139,13 +139,6 @@ Requests, tools, results, personas, resets and registered download artifacts are
 `JARVIS_RELAY_BIND` controls relay listen addresses and defaults safely to `127.0.0.1`.
 
 `CLAUDE_JARVIS_BACKEND_URL` configures the queue relay's network address for the module.
-
-Local watcher/MCP processes receive either:
-
-- `JARVIS_RELAY_TOKEN` for one instance, or
-- `JARVIS_RELAY_TOKENS_JSON` for an instance-to-token map.
-
-Do not store these secrets in the repository.
 
 Voice transcription reads its Mistral key first from `/data/mistral_api_key.txt`, then falls back to `MISTRAL_API_KEY` in the environment. Keep either source outside the repository.
 
