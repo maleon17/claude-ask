@@ -122,3 +122,5 @@ if [ -t 0 ]; then
         [Yy]*) setup_graphify "claude" ;;
     esac
 fi
+
+bash "$ROOT/scripts/setup_userbot_network.sh" claude_ask.py

@@ -72,6 +72,10 @@ ClaudeAsk currently uses the CodexAsk checkout's `telegram_actions_mcp.py`; `set
 
 The installer creates the MCP virtual environment, `mcp_telegram_tools_config.json` and a runtime directory. Replace `__USER__` and `__INSTALL_DIR__` in the service templates before enabling them.
 
+At the end, `setup.sh` asks how to place the userbot: `1` creates a local Ubuntu 24.04 Docker container, `2` configures this backend host for a remote userbot over Tailscale, and `n` skips both. This is separate from the backend Python environment. Option `1` requires Docker Engine and the Compose plugin already installed; [Docker's Ubuntu instructions](https://docs.docker.com/engine/install/ubuntu/) cover that prerequisite.
+
+The local container uses host networking so `.asknet local` reaches the relay on `127.0.0.1:9092`. Its Heroku files and Telegram session live in a Docker volume. Setup asks for the Telegram account's numeric user ID, starts the container, and attaches to its terminal for Heroku's interactive Telegram login. Detach with `Ctrl-P`, then `Ctrl-Q`; the container keeps running. Both Ask setup scripts use the same project at `~/.local/share/telegram-ai-userbot` (override with `TELEGRAM_AI_USERBOT_DIR`), so the two modules can run in one userbot session. The first module is staged before login; running the other setup adds its module and restarts that same container. Then set the relay token and `.asknet local <instance_id>` in Telegram. Existing installed modules remain in the Docker volume; use `.dlm` for later module updates. Do not run another userbot process with the same Telegram session.
+
 The queue relay is shared infrastructure. If `jarvis-ask-cmd-queue.service` is already running for the same deployment, do not launch a second copy on the same ports/directories.
 
 ## Load the userbot module
@@ -94,6 +98,27 @@ or, for a remote backend:
 ```text
 .asknet tailnet <instance_id> <backend_url>
 ```
+
+### Remote userbot over Tailscale
+
+Choose `2` in `setup.sh` on the backend host. It installs Tailscale if needed using the [official Linux installer](https://tailscale.com/docs/install/linux), enables `tailscaled.service`, runs `tailscale up` for the one-time browser login, and shows the backend's tailnet IPv4 address. It also writes a systemd override for `jarvis-ask-cmd-queue.service` so the relay listens on `127.0.0.1` and that tailnet IP, rather than on every host interface. Set `TELEGRAM_AI_QUEUE_UNIT` before setup if the shared relay uses another service name. The relay service and its token/owner configuration must still be installed separately.
+
+The **remote userbot container** must also have `tailscale` and `tailscaled` installed and join the same tailnet. Install the package in its Docker image so container recreation does not remove the binaries. For an Ubuntu/Debian-based image, add a build step like this before starting Heroku:
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://tailscale.com/install.sh -o /tmp/tailscale-install.sh \
+    && sh /tmp/tailscale-install.sh \
+    && rm /tmp/tailscale-install.sh
+```
+
+The Ask module starts `tailscaled` in [userspace networking mode](https://tailscale.com/docs/concepts/userspace-networking) on module load, with an HTTP proxy at `localhost:1056`. It requires a persistent `/data` mount for `/data/tailscale/tailscaled.state`. Set `.asknet tailnet <instance_id> http://<backend-tailnet-ip>:9092` and `.asknet token <token>`, then reload the module so `client_ready` starts the local Tailscale proxy. Run the first interactive login inside that container:
+
+```bash
+docker exec -it <userbot-container> tailscale --socket=/var/run/tailscale/tailscaled.sock up
+```
+
+Open the URL Tailscale prints and approve the device. The module can restart a previously authenticated daemon, but it cannot install Tailscale or perform the first login for you.
 
 The saved network settings survive later module updates.
 
