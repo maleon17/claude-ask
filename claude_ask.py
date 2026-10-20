@@ -2302,6 +2302,19 @@ class ClaudeAsk(loader.Module):
                 return None, "report_to для action=agent должен быть origin или notify"
         elif "report_to" in spec:
             return None, "report_to поддерживается только для action=agent"
+        session = None
+        if action in ("agent", "reply"):
+            # reply covers it too: an action=reply trigger with no
+            # reply_text falls back to the same kind of agentic call
+            # (_fire_reply_via_agent) with the identical implicit
+            # session-routing rule below.
+            raw_session = spec.get("session")
+            if raw_session is not None:
+                session = str(raw_session).strip().lower()
+                if session not in ("origin", "here"):
+                    return None, "session должен быть origin или here"
+        elif "session" in spec:
+            return None, "session поддерживается только для action=agent/reply"
         if action == "post" and not spec.get("target"):
             return None, "action=post требует target"
         engine = str(spec.get("engine") or ENGINE).lower()
@@ -2398,6 +2411,13 @@ class ClaudeAsk(loader.Module):
             trig["report_to"] = report_to
         if "allowed_tools" in spec:
             trig["allowed_tools"] = allowed_tools
+        if session is not None:
+            # Explicit override of _fire_agent_action's implicit "origin
+            # chat's session if registered elsewhere, else the firing
+            # chat's own" default -- absent means keep that default
+            # unchanged (see _fire_agent_action), so existing triggers
+            # created before this field existed don't change behavior.
+            trig["session"] = session
         return trig, None
 
     async def _register_trigger_action(self, chat_arg, specs, chat_id, anchor_msg_id=None):
@@ -2576,6 +2596,11 @@ class ClaudeAsk(loader.Module):
             line = f"- id={t['id']}, [{t.get('engine', 'claude')}] чат «{chat_label}», {t['kind']} → {t['action']}: {t.get('label', '')}"
             if t.get("action") == "agent":
                 line += f"\n  отчёт: {t.get('report_to', 'notify')}"
+            if t.get("session"):
+                # Valid for action=agent and action=reply (the latter only
+                # when it falls back to _fire_reply_via_agent, i.e. no
+                # reply_text) -- see _build_trigger.
+                line += f"\n  сессия: {t['session']}"
             if t.get("kind") in ("keyword", "link") and t.get("value"):
                 values = t["value"] if isinstance(t["value"], list) else [t["value"]]
                 line += "\n  слова: " + ", ".join(map(str, values))
@@ -2859,13 +2884,27 @@ class ClaudeAsk(loader.Module):
                 if trig.get("include_chat_context") else (None, None)
             )
             req_id = str(uuid.uuid4())
-            session_chat_id = str(trig.get("registration_chat_id") or "").strip()
+            origin_chat = str(trig.get("registration_chat_id") or "").strip()
+            # Explicit session override, same rule as _fire_agent_action:
+            # "here" pins to the firing chat's own session regardless of
+            # where the trigger was registered; "origin" pins to the
+            # registration chat's session even if it happens to match (a
+            # no-op then). Absent (None) keeps the historical implicit rule
+            # -- existing triggers created before this field existed must
+            # not change behavior.
+            session_mode = trig.get("session")
+            if session_mode == "here":
+                session_chat_id = None
+            elif session_mode == "origin":
+                session_chat_id = origin_chat or None
+            else:
+                session_chat_id = origin_chat if origin_chat and origin_chat != str(message.chat_id) else None
             enqueue_kwargs = {
                 "topic_id": self._topic_of(message),
                 "requester_id": self._trigger_requester_id(trig, message),
                 "chat_context": chat_context,
             }
-            if session_chat_id and session_chat_id != str(message.chat_id):
+            if session_chat_id:
                 enqueue_kwargs["session_chat_id"] = session_chat_id
             enqueued, _ = await self._enqueue_async(
                 question, message.chat_id, req_id, "chat",
@@ -3071,6 +3110,20 @@ class ClaudeAsk(loader.Module):
                 " Помимо текущего чата send_message разрешён в чат, из которого "
                 "владелец зарегистрировал этот триггер: " + origin_chat + "."
             )
+        # Explicit session override (see _build_trigger): "here" pins to
+        # the firing chat's own session regardless of where the trigger was
+        # registered; "origin" pins to the registration chat's session even
+        # if it happens to match the firing chat (a no-op in that case).
+        # Absent (None) keeps the historical implicit rule just below --
+        # existing triggers created before this field existed must not
+        # change behavior.
+        session_mode = trig.get("session")
+        if session_mode == "here":
+            session_chat_id = None
+        elif session_mode == "origin":
+            session_chat_id = origin_chat or None
+        else:
+            session_chat_id = origin_chat if origin_chat and origin_chat != str(message.chat_id) else None
         # Serializes against both repeat firings of THIS trigger and any
         # _fire_reply_via_agent firing on the same chat -- see that
         # function's comment. Without this, two messages landing close
@@ -3091,8 +3144,8 @@ class ClaudeAsk(loader.Module):
                 "requester_id": self._trigger_requester_id(trig, message),
                 "chat_context": chat_context,
             }
-            if origin_chat and origin_chat != str(message.chat_id):
-                enqueue_kwargs["session_chat_id"] = origin_chat
+            if session_chat_id:
+                enqueue_kwargs["session_chat_id"] = session_chat_id
             enqueued, _ = await self._enqueue_async(
                 prompt, message.chat_id, req_id, "chat",
                 **enqueue_kwargs,

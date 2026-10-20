@@ -275,6 +275,69 @@ def test_trigger_agent_and_reply_enqueue_non_owner_context(monkeypatch, action):
         assert "session_chat_id" not in bot._enqueue.call_args.kwargs
 
 
+@pytest.mark.parametrize("action", ["agent", "reply"])
+@pytest.mark.parametrize(
+    ("session_mode", "registration_chat_id", "expected_session_chat_id"),
+    [
+        ("here", OTHER_CHAT_ID, None),
+        ("origin", OTHER_CHAT_ID, OTHER_CHAT_ID),
+        ("origin", CURRENT_CHAT_ID, CURRENT_CHAT_ID),
+        ("origin", "", None),
+    ],
+)
+def test_explicit_trigger_session_overrides_implicit_default(
+    monkeypatch, action, session_mode, registration_chat_id, expected_session_chat_id,
+):
+    """An explicit "session" field (origin/here) overrides the implicit
+    origin-vs-firing-chat default from _build_trigger -- see
+    test_trigger_agent_and_reply_enqueue_non_owner_context above for that
+    implicit default's own coverage."""
+    trig = trigger(registration_chat_id=registration_chat_id, session=session_mode)
+    bot = make_module({CURRENT_CHAT_ID: [trig]})
+    message = FakeMessage()
+    bot._enqueue = Mock(return_value=True)
+    bot._backend_failed = Mock(return_value=False)
+    bot._dispatch_answer = AsyncMock()
+    bot._poll_result_silent = AsyncMock(return_value=("generated answer", []))
+    bot._fetch_ask_status = Mock(
+        side_effect=lambda req_id: {"request_id": req_id, "done": True, "answer": "generated answer"}
+    )
+
+    if action == "reply":
+        monkeypatch.setattr(claude_ask.asyncio, "sleep", AsyncMock())
+        run_async(bot._fire_reply_via_agent(trig, message, "watched chat", "attacker", allow_fallback=False))
+    else:
+        run_async(bot._fire_agent_action(trig, message, "watched chat", "attacker", allow_fallback=False))
+
+    kwargs = bot._enqueue.call_args.kwargs
+    if expected_session_chat_id is None:
+        assert "session_chat_id" not in kwargs
+    else:
+        assert kwargs["session_chat_id"] == expected_session_chat_id
+
+
+def test_session_field_is_validated_and_persisted():
+    bot = make_module()
+    for action in ("agent", "reply"):
+        extra = {"instruction": "answer"} if action == "agent" else {"reply_text": "pong"}
+        spec, error = bot._build_trigger({
+            "kind": "keyword", "value": ["ping"], "action": action, "session": "here", **extra,
+        })
+        assert error is None, (action, error)
+        assert spec["session"] == "here"
+
+    _, error = bot._build_trigger({
+        "kind": "keyword", "value": ["ping"], "action": "agent",
+        "instruction": "answer", "session": "somewhere",
+    })
+    assert error == "session должен быть origin или here"
+
+    _, error = bot._build_trigger({
+        "kind": "keyword", "value": ["ping"], "action": "delete", "session": "here",
+    })
+    assert error == "session поддерживается только для action=agent/reply"
+
+
 def test_reply_trigger_does_not_duplicate_successful_send_message(monkeypatch):
     bot = make_module()
     trig = trigger(action="reply")
