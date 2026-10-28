@@ -630,7 +630,23 @@ def run_claude_streaming(
                 continue
 
             if t == "result":
-                final_text = d.get("result", "")
+                result_text = d.get("result") or ""
+                if result_text:
+                    final_text = result_text
+                else:
+                    # An empty "result" field usually means the turn itself
+                    # failed (stale --resume session id, auth/rate-limit
+                    # error, max-turns cutoff, ...) rather than a genuinely
+                    # blank answer -- Claude Code's stream-json still emits
+                    # a "result" event in that case, just without usable
+                    # text. Returning "" silently here used to surface as a
+                    # bare "🤖" with nothing after it and no diagnostic
+                    # anywhere (caught live 2026-10-28), and also meant
+                    # is_failure() in jarvis_ask.py never recognized it as a
+                    # failure, so the automatic Claude->Codex fallback in
+                    # claude_ask.py's _do_ask never kicked in either.
+                    subtype = d.get("subtype") or "empty_result"
+                    final_text = f"[[backend_error:claude_{subtype}]] Пустой ответ от Claude Code (subtype={subtype})."
                 continue
 
         proc.wait(timeout=10)
