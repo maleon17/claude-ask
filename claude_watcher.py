@@ -506,6 +506,7 @@ def run_claude_streaming(
     draft_cmd = None
     draft_res_blocks = []
     final_text = None
+    stale_session = False
     thought_history = []
     new_session_id = session_id
 
@@ -646,7 +647,21 @@ def run_claude_streaming(
                     # failure, so the automatic Claude->Codex fallback in
                     # claude_ask.py's _do_ask never kicked in either.
                     subtype = d.get("subtype") or "empty_result"
-                    final_text = f"[[backend_error:claude_{subtype}]] Пустой ответ от Claude Code (subtype={subtype})."
+                    errors = d.get("errors") or []
+                    detail = "; ".join(str(e) for e in errors) if errors else ""
+                    # "No conversation found with session ID" means the
+                    # --resume target no longer exists on disk (session file
+                    # deleted/corrupted, or inherited from a stale value --
+                    # caught live 2026-10-28 right after a fresh Claude Code
+                    # login). Every future message in that chat would retry
+                    # the exact same dead --resume forever otherwise.
+                    stale_session = bool(
+                        session_id and any("No conversation found" in str(e) for e in errors)
+                    )
+                    final_text = (
+                        f"[[backend_error:claude_{subtype}]] Пустой ответ от Claude Code "
+                        f"(subtype={subtype}){': ' + detail if detail else ''}."
+                    )
                 continue
 
         proc.wait(timeout=10)
@@ -655,6 +670,18 @@ def run_claude_streaming(
     finally:
         if proc.poll() is None:
             proc.kill()
+
+    if stale_session:
+        # Clear the dead session and retry once as a fresh conversation
+        # instead of surfacing the error -- the caller (call_llm) persists
+        # whatever session_id this returns, so a successful retry here
+        # self-heals the chat for every message after this one too.
+        return run_claude_streaming(
+            system_prompt, prompt, on_progress, session_id=None, config_dir=config_dir,
+            model=model, mcp_config=mcp_config, chat_id=chat_id, instance_id=instance_id,
+            topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id,
+            request_id=request_id,
+        )
 
     return (final_text if final_text is not None else "[[backend_error:claude_no_response]] (нет ответа)"), thought_history, new_session_id
 
