@@ -57,6 +57,7 @@ import html
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -511,12 +512,19 @@ def run_claude_streaming(
             if exclude_id:
                 env["EXCLUDE_MSG_ID"] = str(exclude_id)
     try:
+        # Its own process group, so a stop request reaches the MCP servers and
+        # shell commands `claude` started, not just `claude` itself.
         proc = subprocess.Popen(
             args, cwd=WORKDIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=env,
+            text=True, bufsize=1, env=env, start_new_session=True,
         )
     except Exception as e:
         return f"[[backend_error:claude_start]] Ошибка Claude: {e}", [], session_id
+    if request_id:
+        with _RUN_LOCK:
+            _RUNNING[request_id] = proc
+        if _cancel_requested(request_id):
+            _cancel_running(request_id)  # the marker arrived before the process existed
 
     draft_thought = None
     draft_cmd_label = None
@@ -687,6 +695,13 @@ def run_claude_streaming(
     finally:
         if proc.poll() is None:
             proc.kill()
+        if request_id:
+            with _RUN_LOCK:
+                _RUNNING.pop(request_id, None)
+
+    if _cancel_requested(request_id):
+        # Whatever the killed process managed to print is not an answer.
+        raise RequestCancelled()
 
     if stale_session:
         # Clear the dead session and retry once as a fresh conversation
@@ -782,14 +797,109 @@ def _atomic_json(path, data):
             pass
 
 
+# --- Cancellation (.stop) ----------------------------------------------------
+# The relay drops "<request_id>.cancel" into the queue directory when the
+# userbot asks to stop a request this worker has already claimed. A watcher
+# thread turns that marker into a signal for the request's `claude -p` process
+# group; the request thread then publishes a "cancelled" result instead of an
+# answer or a backend error.
+class RequestCancelled(Exception):
+    """The request was stopped on purpose; there is no answer to report."""
+
+
+_RUNNING = {}          # request_id -> Popen of its `claude -p`
+_CANCELLED = set()     # request ids asked to stop
+_RUN_LOCK = threading.Lock()
+CANCEL_POLL_S = 0.5
+CANCEL_KILL_GRACE_S = 5
+CANCEL_MARKER_TTL_S = 600
+
+
+def _cancel_marker(req_id):
+    return os.path.join(QUEUE_DIR, f"{req_id}.cancel")
+
+
+def _cancel_requested(req_id):
+    if not req_id:
+        return False
+    with _RUN_LOCK:
+        if req_id in _CANCELLED:
+            return True
+    return os.path.exists(_cancel_marker(req_id))
+
+
+def _signal_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _cancel_running(req_id):
+    """Stop a request's process if it is running; idempotent."""
+    with _RUN_LOCK:
+        first_time = req_id not in _CANCELLED
+        _CANCELLED.add(req_id)
+        proc = _RUNNING.get(req_id)
+    if proc is None or not first_time or proc.poll() is not None:
+        return
+    _signal_group(proc, signal.SIGTERM)
+
+    def force():
+        if proc.poll() is None:
+            _signal_group(proc, signal.SIGKILL)
+
+    timer = threading.Timer(CANCEL_KILL_GRACE_S, force)
+    timer.daemon = True
+    timer.start()
+
+
+def _forget_cancellation(req_id):
+    with _RUN_LOCK:
+        _CANCELLED.discard(req_id)
+    try:
+        os.unlink(_cancel_marker(req_id))
+    except FileNotFoundError:
+        pass
+
+
+def _scan_cancel_markers(now=None):
+    """One pass of the cancel watcher: act on markers, drop abandoned ones."""
+    now = time.time() if now is None else now
+    for fname in os.listdir(QUEUE_DIR):
+        if not fname.endswith(".cancel"):
+            continue
+        req_id = fname[:-len(".cancel")]
+        _cancel_running(req_id)
+        try:
+            # A marker nobody consumed (its request finished first, or never
+            # reached this worker) must not linger forever.
+            if now - os.path.getmtime(os.path.join(QUEUE_DIR, fname)) > CANCEL_MARKER_TTL_S:
+                _forget_cancellation(req_id)
+        except FileNotFoundError:
+            pass
+
+
+def _cancel_watcher_loop():
+    while True:
+        try:
+            _scan_cancel_markers()
+        except Exception as exc:
+            print(f"ERR cancel watcher: {exc}", flush=True)
+        time.sleep(CANCEL_POLL_S)
+
+
 def _process_request(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
     owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
 ):
     result_path = os.path.join(RESULT_DIR, f"{req_id}.json")
+    cancelled_result = {"done": True, "request_id": req_id, "cancelled": True, "answer": "", "thoughts": []}
     with _CONCURRENCY:
         try:
+            if _cancel_requested(req_id):
+                raise RequestCancelled()  # stopped while waiting for its turn
             print(f"[{instance_id}:{chat_id}:{mode}] Q: {question[:80]}...", flush=True)
             answer, thoughts = call_llm(
                 question, chat_id, mode, req_id, instance_id, topic_id=topic_id,
@@ -798,12 +908,17 @@ def _process_request(
             )
             print(f"  A: {answer[:80]}...", flush=True)
             _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": answer, "thoughts": thoughts})
+        except RequestCancelled:
+            print(f"  [{req_id}] stopped on request", flush=True)
+            _atomic_json(result_path, cancelled_result)
         except Exception as e:
             print(f"ERR [{req_id}]: {e}", flush=True)
             try:
                 _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": f"Ошибка воркера: {e}", "thoughts": []})
             except Exception:
                 pass
+        finally:
+            _forget_cancellation(req_id)
 
 
 def _process_request_serialized(
@@ -827,6 +942,7 @@ def _process_request_serialized(
 
 def main():
     print("CLAUDE ASK WATCHER READY (streaming, concurrent)", flush=True)
+    threading.Thread(target=_cancel_watcher_loop, daemon=True).start()
     pending = queue.Queue(maxsize=WORKER_QUEUE_MAX)
     admitted = set()
     admitted_lock = threading.Lock()
