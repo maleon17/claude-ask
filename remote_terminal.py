@@ -23,7 +23,7 @@ import urllib.request
 import urllib.parse
 
 BOT_TOKEN = os.environ.get("TESTBOT_BOT_TOKEN", "")
-CHAT_ID = int(os.environ.get("TESTBOT_CHAT_ID", "8480261623"))
+CHAT_ID = int(os.environ.get("TESTBOT_CHAT_ID") or 0)
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 DONE_MARKER = "Время выполнения"
@@ -31,8 +31,8 @@ EXIT_CODE_RE = re.compile(r"Код выхода\s+(-?\d+)")
 
 
 def _call(method, **params):
-    if not BOT_TOKEN:
-        raise RuntimeError("TESTBOT_BOT_TOKEN is not configured")
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("TESTBOT_BOT_TOKEN and TESTBOT_CHAT_ID must be set")
     data = urllib.parse.urlencode(params).encode()
     with urllib.request.urlopen(f"{API}/{method}", data=data, timeout=30) as r:
         return json.loads(r.read())

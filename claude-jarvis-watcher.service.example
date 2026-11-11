@@ -16,14 +16,17 @@ EnvironmentFile=-__INSTALL_DIR__/jarvis.env
 # JARVIS_RELAY_TOKENS_JSON (instance_id -> token) authenticates this worker's
 # Telegram MCP client to the relay. Written by setup.sh, mode 0600; this
 # worker has its own file so another product's setup never overwrites it.
-EnvironmentFile=-__RELAY_CONFIG_DIR__/relay-token-claude.env
+EnvironmentFile=-__CONFIG_DIR__/relay-token-claude.env
 Environment=CLAUDE_BIN=__CLAUDE_BIN__
 Environment=CLAUDE_JARVIS_MCP_CONFIG=__INSTALL_DIR__/mcp_telegram_tools_config.json
+# The component registry and relay credentials (shared with telegram-ai-core).
+Environment=TELEGRAM_AI_CONFIG_DIR=__CONFIG_DIR__
 # Must match the relay's JARVIS_STATE_DIR: the queues are shared files.
 Environment=JARVIS_STATE_DIR=__STATE_DIR__
 Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
-Environment=JARVIS_TELEGRAM_MCP_PATH=__JARVIS_TELEGRAM_MCP_PATH__
-ExecStart=__VENV_PYTHON__ -u __INSTALL_DIR__/claude_watcher.py
+# __PYTHON__ is telegram-ai-core's virtualenv interpreter (it has the
+# cryptography package this worker needs).
+ExecStart=__PYTHON__ -u __INSTALL_DIR__/claude_watcher.py
 Restart=always
 RestartSec=3
 KillMode=control-group

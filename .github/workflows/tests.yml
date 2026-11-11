@@ -6,5 +6,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: python -m py_compile claude_ask.py claude_watcher.py cmd_queue.py mcp_telegram_tools.py
+      - run: python -m py_compile claude_ask.py claude_watcher.py remote_terminal.py
+      - run: bash -n setup.sh
       - run: ./scripts/run_tests.sh

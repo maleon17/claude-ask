@@ -130,7 +130,11 @@ CHAT_REQUEST_LOCKS_LOCK = threading.Lock()
 # need migrating. Any other instance_id gets its own fresh, separate file.
 _SESSIONS_DIR = os.environ.get("JARVIS_ASK_DIR", os.path.dirname(os.path.abspath(__file__)))
 SESSIONS_FILE = os.path.join(_SESSIONS_DIR, "ask_sessions.json")  # old plaintext path, only for one-time migration below
-DEFAULT_INSTANCE = "andrey"
+# The primary instance: the one that runs on this host's own Claude login
+# (the default config directory). setup.sh records the first registered
+# instance here; every other instance gets an isolated config directory under
+# accounts/ and needs its own `claude auth login` (see _config_dir).
+DEFAULT_INSTANCE = os.environ.get("CLAUDE_JARVIS_PRIMARY_INSTANCE", "default")
 
 # Each instance's session file is encrypted at rest with its OWN key (not
 # shared) -- explicitly a casual/soft boundary, NOT a defense against
