@@ -85,10 +85,27 @@ MCP_CONFIG_PATH = os.environ.get(
 # concurrently (one thread per request), matching cmd_queue.py's ASK_QUEUE_DIR/
 # ASK_RESULT_DIR on the relay side. A single shared file would let concurrent
 # requests overwrite each other's queue entry or progress/result.
-QUEUE_DIR = os.environ.get("CLAUDE_JARVIS_ASK_QUEUE", "/tmp/jarvisask_ask_queue/")
-RESULT_DIR = os.environ.get("CLAUDE_JARVIS_ASK_RESULT", "/tmp/jarvisask_ask_result/")
-os.makedirs(QUEUE_DIR, exist_ok=True)
-os.makedirs(RESULT_DIR, exist_ok=True)
+def _state_dir(env_name, leaf):
+    """Mirrors cmd_queue.py: private 0700 runtime state shared with the relay
+    (never /tmp -- queue items carry chat text and uploaded media)."""
+    override = os.environ.get(env_name)
+    if override:
+        path = override
+    else:
+        base = os.environ.get("JARVIS_STATE_DIR") or os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+            "telegram-ai",
+        )
+        base = os.path.abspath(os.path.expanduser(base))
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        os.chmod(base, 0o700)
+        path = os.path.join(base, leaf)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+QUEUE_DIR = _state_dir("CLAUDE_JARVIS_ASK_QUEUE", "ask_queue")
+RESULT_DIR = _state_dir("CLAUDE_JARVIS_ASK_RESULT", "ask_result")
 SESSIONS_LOCK = threading.Lock()
 # A persisted chat session may only have one live `claude --resume` owner.
 # The global semaphore caps box-wide load, but does not stop two rapid .ask

@@ -23,7 +23,7 @@ flowchart LR
 
 The important trust boundary is intentional: **the backend does not own your Telegram account**. Telegram actions are queued back to the module that holds the live Telethon session. The action gets a real result before the agent can treat it as completed.
 
-The module submits `.ask` work to the relay's `/ask` endpoint. The worker returns progress and answers through `/tmp/jarvisask_ask_*`; MCP action calls use `/tmp/jarvisask_tool_queue` before the userbot executes them.
+The module submits `.ask` work to the relay's `/ask` endpoint. Queue items, progress, answers and uploaded files are exchanged through a private state directory (`~/.local/state/telegram-ai` by default, mode `0700`) — never `/tmp`, because they carry chat text and media.
 
 ## What is included
 
@@ -52,26 +52,30 @@ Requirements:
 
 - Linux with Python 3.10+
 - Claude Code CLI authenticated with `claude auth login --claudeai`
-- `systemd` and `sudo`
+- `systemd` and `sudo` (only to install the two service units)
+- the [CodexAsk](https://github.com/maleon17/codex-ask) checkout next to this one — ClaudeAsk uses the Telegram-action MCP server that ships there (you do not have to install or run CodexAsk itself)
 - a supported Telethon/Hikka userbot; this project targets [Heroku](https://github.com/coddrago/Heroku)
 
 Heroku may run on the same host or in Docker on a separate host; the latter is a deployment choice, not a requirement.
 
 ```bash
+git clone https://github.com/maleon17/codex-ask.git
 git clone https://github.com/maleon17/claude-ask.git
 cd claude-ask
-chmod +x setup.sh
 ./setup.sh
 ```
 
 `setup.sh` does everything on the backend side in one pass:
 
-- creates the MCP virtual environment and `mcp_telegram_tools_config.json` (asks for the CodexAsk checkout's `telegram_actions_mcp.py`, or reads `JARVIS_TELEGRAM_MCP_PATH`)
-- writes the persona env (`jarvis.env`)
+- finds the CodexAsk checkout's `telegram_actions_mcp.py` (a sibling `codex-ask` directory is detected automatically; otherwise it asks, or reads `JARVIS_TELEGRAM_MCP_PATH`) and stops right there with instructions if it is missing
+- creates the MCP virtual environment and `mcp_telegram_tools_config.json`
+- writes the persona env (`jarvis.env`), keeping any other keys already in that file
 - registers an owner and generates a relay token for an `instance_id` you choose (1–64 letters/digits/`_`/`-`, starting with a letter or digit), under [Relay authentication](#relay-authentication-and-trust-boundary) — printing the exact `.asknet` commands to paste into Telegram at the end
 - installs and starts the `jarvis-ask-cmd-queue` and `jarvis-ask-watcher` systemd services (skipping either one that's already running, since both are shared infrastructure — safe to re-run for a second instance)
 - optionally builds the graphify code map
 - optionally builds and starts a local Docker userbot container (Heroku image, first-run Telegram sign-in included), or configures Tailscale on this host for a remote userbot
+
+Every question can also be answered through environment variables (listed at the top of `setup.sh`), so the install can run unattended.
 
 The only things it cannot do for you: the Claude Code login itself, and anything that has to happen inside Telegram (loading the module, running `.asknet`, the userbot's own first-time Telegram sign-in if you're not using the Docker option).
 
@@ -83,7 +87,7 @@ Send `claude_ask.py` as a document to the userbot's test channel and reply with:
 .lm
 ```
 
-Then run `.asknet` with the exact `<token>` and `<instance_id>` `setup.sh` printed to your terminal a moment ago (or that `cmd_queue.py --add-token <instance_id>` printed, if you generated them by hand — see [Relay authentication](#relay-authentication-and-trust-boundary)). That token is shown once and stored nowhere else in plaintext; if you lost it, re-run `setup.sh` or `cmd_queue.py --add-token` again to mint a new one for the same instance:
+Then run `.asknet` with the exact `<token>` and `<instance_id>` `setup.sh` printed to your terminal a moment ago (or that `cmd_queue.py --add-token <instance_id>` printed, if you generated them by hand — see [Relay authentication](#relay-authentication-and-trust-boundary)). That token is shown once and stored nowhere else in plaintext; if you lost it, re-run `setup.sh` or `cmd_queue.py --add-token` again to mint another one for the same instance (older tokens stay valid until revoked):
 
 ```text
 .asknet token <token>
@@ -123,12 +127,25 @@ Verify `.ask`, `.new`, and at least one request that uses a real Telegram tool s
 
 ## Relay authentication and trust boundary
 
-The relay requires:
+The relay keeps two small maps in `~/.config/telegram-ai/` (override with `JARVIS_RELAY_CONFIG_DIR`, or name the files directly with `JARVIS_RELAY_TOKENS_FILE` / `JARVIS_RELAY_OWNERS_FILE`):
 
-- `JARVIS_RELAY_TOKENS_FILE` (default `/etc/jarvis-ask/relay-tokens.json`): server-side mapping of `sha256(token)` to `instance_id`
-- `JARVIS_RELAY_OWNERS_FILE` (default `/etc/jarvis-ask/relay-owners.json`): server-side mapping of `instance_id` to Telegram owner ID
+- `relay-tokens.json` — `sha256(token)` → `instance_id`; the token itself is never stored there
+- `relay-owners.json` — `instance_id` → Telegram owner ID
 
-Both live outside the checkout with mode `0600`. `setup.sh` registers the owner and generates the token for you (and restarts the relay so it takes effect), then writes `JARVIS_RELAY_TOKEN=<token>` into `/etc/jarvis-ask/relay-token.env` (mode `0600`), which the watcher's systemd unit reads via `EnvironmentFile=` to authenticate its local Telegram MCP client back to the relay. The raw token is printed to your terminal exactly once and stored nowhere else in plaintext — that's the `<token>` for `.asknet token` in [Load the userbot module](#load-the-userbot-module). To add another instance later, re-run `setup.sh` — it reuses the already-running relay and watcher rather than reinstalling them (for a second instance on the same watcher, it prints the new token separately and asks you to combine both into `JARVIS_RELAY_TOKENS_JSON` yourself — an instance_id → token JSON map — instead of the single-instance `JARVIS_RELAY_TOKEN`). To do any of this by hand instead, see [Manual setup](#manual-setup-without-setupsh).
+Both are mode `0600` and owned by the user the relay runs as. No `sudo` is involved in managing them, and the running relay notices an edit by itself — adding an instance does not restart it or drop requests in flight.
+
+`setup.sh` registers the owner and mints the token, then records that token in `relay-token-claude.env` in the same directory. The watcher's systemd unit reads it through `EnvironmentFile=` as `JARVIS_RELAY_TOKENS_JSON` (an `instance_id` → token map), which is how its local Telegram MCP client authenticates back to the relay. CodexAsk keeps its own `relay-token-codex.env`, so installing one product never overwrites the other's credentials. The raw token is printed to your terminal once — that is the `<token>` for `.asknet token` in [Load the userbot module](#load-the-userbot-module).
+
+To add another instance later, re-run `setup.sh`: it reuses the running relay and watcher, and only asks you to restart the watcher (which reads its token file at start) once nothing is in flight.
+
+Managing instances by hand, with the virtualenv's interpreter:
+
+```bash
+.venv/bin/python cmd_queue.py --list                      # instances, owners, token counts
+.venv/bin/python cmd_queue.py --set-owner mybot 123456789
+.venv/bin/python cmd_queue.py --add-token mybot           # prints the new token once
+.venv/bin/python cmd_queue.py --revoke-tokens mybot       # invalidates every token of that instance
+```
 
 The authenticated userbot reports `requester_id`. The relay cannot independently prove the original Telegram sender, so the authenticated userbot remains an explicit trust boundary. Owner authorization is nevertheless derived server-side from the token's instance mapping; the client cannot simply claim to be the owner.
 
@@ -137,6 +154,8 @@ Requests, tools, results, personas, resets and registered download artifacts are
 ## Network configuration
 
 `JARVIS_RELAY_BIND` controls relay listen addresses and defaults safely to `127.0.0.1`.
+
+`JARVIS_STATE_DIR` (default `~/.local/state/telegram-ai`) holds the queues, uploads and request manifests. The relay and every worker on the host must use the same value — they exchange files there.
 
 `CLAUDE_JARVIS_BACKEND_URL` configures the queue relay's network address for the module.
 
@@ -157,30 +176,17 @@ sed -e "s|__MCP_PYTHON__|$PWD/.venv/bin/python|g" -e "s|__INSTALL_DIR__|$PWD|g" 
 mkdir -p runtime && chmod 700 runtime
 ```
 
-Relay token and owner, for an instance named `mybot`:
+Relay owner and token for an instance named `mybot`, run as the user the services will run as (no `sudo`):
 
 ```bash
-sudo mkdir -p /etc/jarvis-ask
-python3 - <<'PY'
-import json, os
-path = "/etc/jarvis-ask/relay-owners.json"
-data = json.load(open(path)) if os.path.exists(path) else {}
-data["mybot"] = 123456789  # your numeric Telegram ID
-json.dump(data, open(path, "w"), indent=2)
-os.chmod(path, 0o600)
-PY
-sudo env JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json \
-  python3 cmd_queue.py --add-token mybot
+.venv/bin/python cmd_queue.py --set-owner mybot 123456789   # your numeric Telegram ID
+.venv/bin/python cmd_queue.py --add-token mybot \
+    --worker-env ~/.config/telegram-ai/relay-token-claude.env
 ```
 
-The token is printed once; save it. Write it where the watcher can read it:
+The token is printed once; save it for `.asknet token`. `--worker-env` also records it for the watcher.
 
-```bash
-echo "JARVIS_RELAY_TOKEN=<printed token>" | sudo tee /etc/jarvis-ask/relay-token.env
-sudo chmod 600 /etc/jarvis-ask/relay-token.env
-```
-
-systemd services, after replacing `__USER__`, `__INSTALL_DIR__`, `__VENV_PYTHON__` ($PWD/.venv/bin/python) and `__JARVIS_TELEGRAM_MCP_PATH__` (path to CodexAsk's `telegram_actions_mcp.py`) in the two `.service.example` files:
+systemd services, after replacing the placeholders in the two `.service.example` files — `__USER__`, `__HOME__`, `__INSTALL_DIR__`, `__VENV_PYTHON__` (`$PWD/.venv/bin/python`), `__CLAUDE_BIN__` (`command -v claude`), `__RELAY_CONFIG_DIR__` (`~/.config/telegram-ai`), `__STATE_DIR__` (`~/.local/state/telegram-ai`) and `__JARVIS_TELEGRAM_MCP_PATH__` (CodexAsk's `telegram_actions_mcp.py`):
 
 ```bash
 sudo install -m 0644 claude-jarvis-queue.service.example /etc/systemd/system/jarvis-ask-cmd-queue.service
@@ -189,7 +195,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now jarvis-ask-cmd-queue.service jarvis-ask-watcher.service
 ```
 
-Skip the first `install`/`enable` if `jarvis-ask-cmd-queue.service` is already running for this deployment — it's shared infrastructure; do not run two copies. If you add a token to an already-running relay, restart it (`sudo systemctl restart jarvis-ask-cmd-queue.service`) — it only reads the tokens/owners files at startup.
+Skip the first `install`/`enable` if `jarvis-ask-cmd-queue.service` is already running for this deployment — it's shared infrastructure; do not run two copies. The relay refuses to start until at least one instance is registered.
 
 Local Docker userbot, without the `scripts/setup_userbot_network.sh` wrapper: copy `deploy/userbot/{Dockerfile,entrypoint.sh,compose.yaml}` into a project directory, set `USERBOT_TG_ID` in a `.env` file next to them, put `claude_ask.py` under `modules/ClaudeAsk.py`, then `docker compose up -d --build` and attach once (`docker attach --sig-proxy=false --detach-keys=ctrl-p,ctrl-q <container>`) to complete Heroku's Telegram sign-in. For a remote userbot, see [Remote userbot over Tailscale](#remote-userbot-over-tailscale) above — those commands don't depend on any script either.
 

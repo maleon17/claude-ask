@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Installer for the ClaudeAsk backend: the shared queue relay (cmd_queue.py)
+# and the Claude Code worker (claude_watcher.py).
+#
+# Safe to re-run: existing jarvis.env keys are kept, running services are left
+# running, and a token added for another instance takes effect without a relay
+# restart.
+#
+# Every question can be answered through the environment instead, which makes
+# an unattended install possible:
+#   JARVIS_TELEGRAM_MCP_PATH  CodexAsk's telegram_actions_mcp.py
+#   JARVIS_OWNER_NAME, JARVIS_OWNER_TG_ID, JARVIS_NOMATS_CHAT_IDS, JARVIS_PERSONA_DIR
+#   JARVIS_INSTANCE_ID        instance to register with the relay
+#   JARVIS_RELAY_CONFIG_DIR   token/owner maps   (default ~/.config/telegram-ai)
+#   JARVIS_STATE_DIR          queues and uploads (default ~/.local/state/telegram-ai)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -6,39 +20,90 @@ cd "$ROOT"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found"; }
+as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+# ask VAR "prompt" [default] -- a value already in the environment wins, then
+# an interactive answer, then the default.
+ask() {
+    local variable="$1" prompt="$2" fallback="${3:-}" value="${!1:-}"
+    if [[ -z "$value" && -t 0 ]]; then read -r -p "$prompt" value || value=""; fi
+    printf -v "$variable" '%s' "${value:-$fallback}"
+}
+# env_file_set FILE KEY VALUE -- replace one key, keep every other line.
+env_file_set() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import os, sys
+path, key, value = sys.argv[1:4]
+try:
+    lines = open(path, encoding="utf-8").read().splitlines()
+except FileNotFoundError:
+    lines = []
+lines = [line for line in lines if not line.startswith(key + "=")]
+lines.append(f"{key}={value}")
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(lines) + "\n")
+os.replace(tmp, path)
+PY
+}
+env_file_get() { [[ -f "$1" ]] && sed -n "s/^$2=//p" "$1" | tail -n 1 || true; }
+# The value of one variable in a running service's environment, if readable.
+running_env() {
+    local pid
+    pid="$(systemctl show -p MainPID --value "$1" 2>/dev/null || true)"
+    [[ -n "$pid" && "$pid" != 0 && -r "/proc/$pid/environ" ]] || return 0
+    tr '\0' '\n' < "/proc/$pid/environ" | sed -n "s/^$2=//p" | tail -n 1
+}
 
 echo "== Claude Jarvis setup =="
 need python3
-need claude
 need systemctl
-need sudo
+[[ $EUID -eq 0 ]] || need sudo
+python3 -c 'import ensurepip, venv' >/dev/null 2>&1 \
+    || die "python3 venv support is missing (Debian/Ubuntu: sudo apt install python3-venv)"
 
-claude auth status >/dev/null 2>&1 || die "Claude Code is not logged in; run: claude auth login --claudeai"
-echo "Claude account: authenticated"
+CLAUDE_BIN="$(command -v claude || true)"
+[[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]] && CLAUDE_BIN="$HOME/.local/bin/claude"
+[[ -n "$CLAUDE_BIN" ]] || die "Claude Code CLI not found; install it: curl -fsSL https://claude.ai/install.sh | bash"
+"$CLAUDE_BIN" auth status >/dev/null 2>&1 || die "Claude Code is not logged in; run: $CLAUDE_BIN auth login --claudeai"
+echo "Claude account: authenticated ($CLAUDE_BIN)"
+
+# --- Telegram-action MCP server (lives in the CodexAsk checkout) ------------
+# Checked before anything is installed, so a missing checkout fails fast.
+DEFAULT_MCP_PATH="${JARVIS_TELEGRAM_MCP_PATH:-}"
+if [[ -z "$DEFAULT_MCP_PATH" ]]; then
+    for candidate in "$ROOT/../codex-ask" "$ROOT/../codex-jarvis" "$HOME/codex-ask" "$HOME/codex-jarvis"; do
+        if [[ -f "$candidate/telegram_actions_mcp.py" ]]; then
+            DEFAULT_MCP_PATH="$(cd "$candidate" && pwd)/telegram_actions_mcp.py"
+            break
+        fi
+    done
+fi
+ask JARVIS_TELEGRAM_MCP_PATH "CodexAsk telegram_actions_mcp.py [${DEFAULT_MCP_PATH:-not found}]: " "$DEFAULT_MCP_PATH"
+if [[ ! -f "$JARVIS_TELEGRAM_MCP_PATH" ]]; then
+    die "CodexAsk's telegram_actions_mcp.py not found${JARVIS_TELEGRAM_MCP_PATH:+ at $JARVIS_TELEGRAM_MCP_PATH}.
+ClaudeAsk uses the Telegram-action MCP server shipped with CodexAsk. Clone it
+next to this checkout and re-run:
+  git clone https://github.com/maleon17/codex-ask.git \"$(dirname "$ROOT")/codex-ask\"
+(or point JARVIS_TELEGRAM_MCP_PATH at an existing copy)."
+fi
+JARVIS_TELEGRAM_MCP_PATH="$(cd "$(dirname "$JARVIS_TELEGRAM_MCP_PATH")" && pwd)/$(basename "$JARVIS_TELEGRAM_MCP_PATH")"
 
 MCP_VENV="${CLAUDE_JARVIS_MCP_VENV:-$ROOT/.venv}"
+VENV_PYTHON="$MCP_VENV/bin/python"
 echo "Installing Python dependencies into $MCP_VENV"
 python3 -m venv "$MCP_VENV"
-"$MCP_VENV/bin/python" -m pip install --upgrade pip >/dev/null
-"$MCP_VENV/bin/python" -m pip install -r requirements.txt -r requirements-mcp.txt
-
-DEFAULT_MCP_PATH="${JARVIS_TELEGRAM_MCP_PATH:-$HOME/codex-jarvis/telegram_actions_mcp.py}"
-if [ -t 0 ]; then
-    read -rp "CodexAsk telegram_actions_mcp.py [$DEFAULT_MCP_PATH]: " JARVIS_TELEGRAM_MCP_PATH
-fi
-JARVIS_TELEGRAM_MCP_PATH="${JARVIS_TELEGRAM_MCP_PATH:-$DEFAULT_MCP_PATH}"
-[[ -f "$JARVIS_TELEGRAM_MCP_PATH" ]] || die "CodexAsk MCP implementation not found: $JARVIS_TELEGRAM_MCP_PATH"
+"$VENV_PYTHON" -m pip install --quiet --upgrade pip
+"$VENV_PYTHON" -m pip install --quiet -r requirements.txt -r requirements-mcp.txt
 
 sed \
-    -e "s|__MCP_PYTHON__|$MCP_VENV/bin/python|g" \
+    -e "s|__MCP_PYTHON__|$VENV_PYTHON|g" \
     -e "s|__INSTALL_DIR__|$ROOT|g" \
     mcp_telegram_tools_config.json.example > mcp_telegram_tools_config.json
 mkdir -p "$ROOT/runtime"
 chmod 700 "$ROOT/runtime"
 
 python3 -m py_compile claude_watcher.py cmd_queue.py mcp_telegram_tools.py remote_terminal.py
-
-echo
 echo "Prepared local MCP config: $ROOT/mcp_telegram_tools_config.json"
 
 # --- Jarvis persona: profanity notice + env (owner + softening list) ------
@@ -61,34 +126,29 @@ PY
 }
 
 JARVIS_ENV="$ROOT/jarvis.env"
-J_OWNER_TG_ID=""
-if [ -t 0 ]; then
-    read -rp "Owner display name for the persona template (blank to skip): " J_OWNER_NAME || J_OWNER_NAME=""
-    read -rp "Owner Telegram numeric id for the persona template (blank to skip): " J_OWNER_TG_ID || J_OWNER_TG_ID=""
-    read -rp "Chat ids where profanity is suppressed, comma-separated (blank for none): " J_NOMATS || J_NOMATS=""
-    read -rp "Shared persona directory [$ROOT/personas]: " J_PERSONA_DIR || J_PERSONA_DIR=""
-    J_OWNER_NAME="$(_jarvis_clean "$J_OWNER_NAME")"
-    J_OWNER_TG_ID="$(printf '%s' "$J_OWNER_TG_ID" | tr -cd '0-9')"
-    J_NOMATS="$(printf '%s' "$J_NOMATS" | tr -cd '0-9,-')"
-    J_PERSONA_DIR="$(_jarvis_clean "${J_PERSONA_DIR:-$ROOT/personas}")"
-    if [ "$J_PERSONA_DIR" != "$ROOT/personas" ]; then
-        mkdir -p "$J_PERSONA_DIR"
-        [ -f "$J_PERSONA_DIR/default.md.example" ] || \
-            cp "$ROOT/personas/default.md.example" "$J_PERSONA_DIR/default.md.example"
-    fi
-    ( umask 177; : > "$JARVIS_ENV" )
-    {
-        [ -n "$J_OWNER_NAME" ]  && printf 'JARVIS_OWNER_NAME=%s\n'  "$J_OWNER_NAME"
-        [ -n "$J_OWNER_TG_ID" ] && printf 'JARVIS_OWNER_TG_ID=%s\n' "$J_OWNER_TG_ID"
-        printf 'JARVIS_NOMATS_CHAT_IDS=%s\n' "$J_NOMATS"
-        printf 'JARVIS_PERSONA_DIR=%s\n' "$J_PERSONA_DIR"
-    } >> "$JARVIS_ENV"
-    chmod 600 "$JARVIS_ENV"
-    echo "Wrote $JARVIS_ENV (git-ignored; the watcher loads it via EnvironmentFile=)."
-    echo "If the shared cmd_queue.py (from Claude-jarvis) runs from another directory,"
-    echo "set the SAME JARVIS_PERSONA_DIR in its service unit too, otherwise"
-    echo ".persona/.xpersona writes will not reach this watcher."
+PREV_OWNER_NAME="$(env_file_get "$JARVIS_ENV" JARVIS_OWNER_NAME)"
+PREV_OWNER_TG_ID="$(env_file_get "$JARVIS_ENV" JARVIS_OWNER_TG_ID)"
+PREV_NOMATS="$(env_file_get "$JARVIS_ENV" JARVIS_NOMATS_CHAT_IDS)"
+PREV_PERSONA_DIR="$(env_file_get "$JARVIS_ENV" JARVIS_PERSONA_DIR)"
+ask JARVIS_OWNER_NAME "Owner display name for the persona template [${PREV_OWNER_NAME:-skip}]: " "$PREV_OWNER_NAME"
+ask JARVIS_OWNER_TG_ID "Owner Telegram numeric id (message @userinfobot to get it) [${PREV_OWNER_TG_ID:-skip}]: " "$PREV_OWNER_TG_ID"
+ask JARVIS_NOMATS_CHAT_IDS "Chat ids where profanity is suppressed, comma-separated [${PREV_NOMATS:-none}]: " "$PREV_NOMATS"
+ask JARVIS_PERSONA_DIR "Persona directory [${PREV_PERSONA_DIR:-$ROOT/personas}]: " "${PREV_PERSONA_DIR:-$ROOT/personas}"
+J_OWNER_NAME="$(_jarvis_clean "$JARVIS_OWNER_NAME")"
+J_OWNER_TG_ID="$(printf '%s' "$JARVIS_OWNER_TG_ID" | tr -cd '0-9')"
+J_NOMATS="$(printf '%s' "$JARVIS_NOMATS_CHAT_IDS" | tr -cd '0-9,-')"
+J_PERSONA_DIR="$(_jarvis_clean "$JARVIS_PERSONA_DIR")"
+if [[ "$J_PERSONA_DIR" != "$ROOT/personas" ]]; then
+    mkdir -p "$J_PERSONA_DIR"
+    [[ -f "$J_PERSONA_DIR/default.md.example" ]] || \
+        cp "$ROOT/personas/default.md.example" "$J_PERSONA_DIR/default.md.example"
 fi
+[[ -n "$J_OWNER_NAME" ]]  && env_file_set "$JARVIS_ENV" JARVIS_OWNER_NAME "$J_OWNER_NAME"
+[[ -n "$J_OWNER_TG_ID" ]] && env_file_set "$JARVIS_ENV" JARVIS_OWNER_TG_ID "$J_OWNER_TG_ID"
+env_file_set "$JARVIS_ENV" JARVIS_NOMATS_CHAT_IDS "$J_NOMATS"
+env_file_set "$JARVIS_ENV" JARVIS_PERSONA_DIR "$J_PERSONA_DIR"
+chmod 600 "$JARVIS_ENV"
+echo "Wrote $JARVIS_ENV (git-ignored; both services load it via EnvironmentFile=)."
 
 # --- Relay authentication + systemd services --------------------------------
 # The queue relay (cmd_queue.py) and the watcher (claude_watcher.py) are
@@ -98,67 +158,49 @@ fi
 # already serving traffic.
 QUEUE_SERVICE_NAME="${CLAUDE_JARVIS_QUEUE_SERVICE:-jarvis-ask-cmd-queue.service}"
 WATCHER_SERVICE_NAME="${CLAUDE_JARVIS_WATCHER_SERVICE:-jarvis-ask-watcher.service}"
-RELAY_TOKENS_FILE="${JARVIS_RELAY_TOKENS_FILE:-/etc/jarvis-ask/relay-tokens.json}"
-RELAY_OWNERS_FILE="${JARVIS_RELAY_OWNERS_FILE:-/etc/jarvis-ask/relay-owners.json}"
-RELAY_TOKEN_ENV_FILE="${CLAUDE_JARVIS_RELAY_TOKEN_ENV:-/etc/jarvis-ask/relay-token.env}"
 
 QUEUE_ACTIVE=0
 WATCHER_ACTIVE=0
 systemctl is-active --quiet "$QUEUE_SERVICE_NAME" 2>/dev/null && QUEUE_ACTIVE=1
 systemctl is-active --quiet "$WATCHER_SERVICE_NAME" 2>/dev/null && WATCHER_ACTIVE=1
 
+# A relay that is already running is the source of truth for where its
+# credentials and queues live; a new token written anywhere else is invisible
+# to it.
+if (( QUEUE_ACTIVE )); then
+    for name in JARVIS_RELAY_CONFIG_DIR JARVIS_RELAY_TOKENS_FILE JARVIS_RELAY_OWNERS_FILE JARVIS_STATE_DIR; do
+        live_value="$(running_env "$QUEUE_SERVICE_NAME" "$name")"
+        [[ -n "$live_value" ]] && export "$name=$live_value"
+    done
+fi
+RELAY_CONFIG_DIR="${JARVIS_RELAY_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/telegram-ai}"
+STATE_DIR="${JARVIS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/telegram-ai}"
+export JARVIS_RELAY_CONFIG_DIR="$RELAY_CONFIG_DIR" JARVIS_STATE_DIR="$STATE_DIR"
+mkdir -p "$RELAY_CONFIG_DIR" "$STATE_DIR"
+chmod 700 "$RELAY_CONFIG_DIR" "$STATE_DIR"
+WORKER_TOKEN_ENV="$RELAY_CONFIG_DIR/relay-token-claude.env"
+
 echo
 echo "== Relay authentication =="
-INSTANCE_ID=""
-OWNER_TG_ID=""
 RELAY_TOKEN=""
-if [ -t 0 ]; then
-    read -rp "Instance ID for this ClaudeAsk deployment (e.g. mybot; blank to configure later): " INSTANCE_ID || INSTANCE_ID=""
-fi
+ask JARVIS_INSTANCE_ID "Instance ID for this ClaudeAsk deployment (e.g. mybot; blank to configure later): " ""
+INSTANCE_ID="$JARVIS_INSTANCE_ID"
 if [[ -n "$INSTANCE_ID" ]]; then
     [[ "$INSTANCE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || die "invalid instance id: $INSTANCE_ID"
-    read -rp "Owner Telegram numeric ID for instance '$INSTANCE_ID'${J_OWNER_TG_ID:+ [$J_OWNER_TG_ID]}: " OWNER_TG_ID || OWNER_TG_ID=""
-    OWNER_TG_ID="${OWNER_TG_ID:-$J_OWNER_TG_ID}"
-    OWNER_TG_ID="$(printf '%s' "$OWNER_TG_ID" | tr -cd '0-9')"
+    ask JARVIS_INSTANCE_OWNER_TG_ID "Owner Telegram numeric ID for instance '$INSTANCE_ID'${J_OWNER_TG_ID:+ [$J_OWNER_TG_ID]}: " "$J_OWNER_TG_ID"
+    OWNER_TG_ID="$(printf '%s' "$JARVIS_INSTANCE_OWNER_TG_ID" | tr -cd '0-9')"
     [[ -n "$OWNER_TG_ID" ]] || die "owner Telegram ID is required to authorize instance '$INSTANCE_ID'"
 
-    sudo mkdir -p "$(dirname "$RELAY_OWNERS_FILE")"
-    sudo python3 - "$RELAY_OWNERS_FILE" "$INSTANCE_ID" "$OWNER_TG_ID" <<'PY'
-import json, os, sys
-path, instance_id, owner_id = sys.argv[1:4]
-try:
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-except FileNotFoundError:
-    data = {}
-data[instance_id] = int(owner_id)
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-PY
-    RELAY_TOKEN="$(sudo env JARVIS_RELAY_TOKENS_FILE="$RELAY_TOKENS_FILE" python3 "$ROOT/cmd_queue.py" --add-token "$INSTANCE_ID")"
-    echo "Registered owner $OWNER_TG_ID for instance '$INSTANCE_ID' in $RELAY_OWNERS_FILE"
-
-    if (( QUEUE_ACTIVE )); then
-        # cmd_queue.py only reads the tokens/owners files at startup.
-        sudo systemctl restart "$QUEUE_SERVICE_NAME"
-        echo "Restarted $QUEUE_SERVICE_NAME to load the new token/owner mapping."
-    fi
-
+    # The relay's own interpreter: cmd_queue.py imports packages that exist
+    # only in the virtualenv, and the maps must stay owned by the relay user.
+    "$VENV_PYTHON" "$ROOT/cmd_queue.py" --set-owner "$INSTANCE_ID" "$OWNER_TG_ID"
+    RELAY_TOKEN="$("$VENV_PYTHON" "$ROOT/cmd_queue.py" --add-token "$INSTANCE_ID" --worker-env "$WORKER_TOKEN_ENV")"
+    echo "Registered owner $OWNER_TG_ID and a new token for instance '$INSTANCE_ID' in $RELAY_CONFIG_DIR"
+    echo "(a running relay picks this up by itself; no restart needed)."
     if (( WATCHER_ACTIVE )); then
-        echo "jarvis-ask-watcher is already active with a token for another instance;"
-        echo "this setup only wires a single JARVIS_RELAY_TOKEN per watcher. To serve"
-        echo "a second instance from the same watcher, combine tokens yourself into"
-        echo "JARVIS_RELAY_TOKENS_JSON (see 'Network configuration' in the README)."
-        echo "Your new token for '$INSTANCE_ID' (save it, it is not stored anywhere):"
-        echo "  $RELAY_TOKEN"
-    else
-        sudo install -d -m 0755 "$(dirname "$RELAY_TOKEN_ENV_FILE")"
-        printf 'JARVIS_RELAY_TOKEN=%s\n' "$RELAY_TOKEN" | sudo tee "$RELAY_TOKEN_ENV_FILE" >/dev/null
-        sudo chmod 600 "$RELAY_TOKEN_ENV_FILE"
-        echo "Wrote $RELAY_TOKEN_ENV_FILE (root-only; the watcher service reads it)."
+        echo "NOTE: $WATCHER_SERVICE_NAME is already running and reads $WORKER_TOKEN_ENV"
+        echo "only at start. Restart it once no .ask is in flight:"
+        echo "  sudo systemctl restart $WATCHER_SERVICE_NAME"
     fi
 else
     echo "No instance ID given; skipping relay token generation."
@@ -168,50 +210,61 @@ fi
 
 echo
 echo "== systemd services =="
+render_unit() {  # render_unit TEMPLATE -> path of the rendered temp file
+    local rendered
+    rendered="$(mktemp)"
+    sed \
+        -e "s|__USER__|$(id -un)|g" \
+        -e "s|__HOME__|$HOME|g" \
+        -e "s|__INSTALL_DIR__|$ROOT|g" \
+        -e "s|__VENV_PYTHON__|$VENV_PYTHON|g" \
+        -e "s|__CLAUDE_BIN__|$CLAUDE_BIN|g" \
+        -e "s|__RELAY_CONFIG_DIR__|$RELAY_CONFIG_DIR|g" \
+        -e "s|__STATE_DIR__|$STATE_DIR|g" \
+        -e "s|__JARVIS_TELEGRAM_MCP_PATH__|$JARVIS_TELEGRAM_MCP_PATH|g" \
+        "$1" > "$rendered"
+    printf '%s' "$rendered"
+}
 if (( QUEUE_ACTIVE )); then
     echo "$QUEUE_SERVICE_NAME is already active; reusing it (not reinstalling the relay)."
 else
-    QUEUE_UNIT_FILE="$(mktemp "/tmp/${QUEUE_SERVICE_NAME%.service}.XXXXXX")"
-    sed \
-        -e "s|__USER__|$(id -un)|g" \
-        -e "s|__INSTALL_DIR__|$ROOT|g" \
-        -e "s|__VENV_PYTHON__|$MCP_VENV/bin/python|g" \
-        claude-jarvis-queue.service.example > "$QUEUE_UNIT_FILE"
+    UNIT_FILE="$(render_unit claude-jarvis-queue.service.example)"
     echo "Installing /etc/systemd/system/$QUEUE_SERVICE_NAME (sudo required)"
-    sudo install -m 0644 "$QUEUE_UNIT_FILE" "/etc/systemd/system/$QUEUE_SERVICE_NAME"
-    rm -f "$QUEUE_UNIT_FILE"
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now "$QUEUE_SERVICE_NAME"
-    QUEUE_ACTIVE=1
+    as_root install -m 0644 "$UNIT_FILE" "/etc/systemd/system/$QUEUE_SERVICE_NAME"
+    rm -f "$UNIT_FILE"
+    as_root systemctl daemon-reload
+    if [[ -n "$INSTANCE_ID" ]]; then
+        as_root systemctl enable --now "$QUEUE_SERVICE_NAME"
+    else
+        # The relay refuses to start without at least one registered instance.
+        as_root systemctl enable "$QUEUE_SERVICE_NAME"
+        echo "$QUEUE_SERVICE_NAME is installed but not started: no instance is registered yet."
+    fi
 fi
 
 if (( WATCHER_ACTIVE )); then
     echo "$WATCHER_SERVICE_NAME is already active; leaving it running."
 else
-    WATCHER_UNIT_FILE="$(mktemp "/tmp/${WATCHER_SERVICE_NAME%.service}.XXXXXX")"
-    sed \
-        -e "s|__USER__|$(id -un)|g" \
-        -e "s|__INSTALL_DIR__|$ROOT|g" \
-        -e "s|__VENV_PYTHON__|$MCP_VENV/bin/python|g" \
-        -e "s|__JARVIS_TELEGRAM_MCP_PATH__|$JARVIS_TELEGRAM_MCP_PATH|g" \
-        claude-jarvis-watcher.service.example > "$WATCHER_UNIT_FILE"
+    UNIT_FILE="$(render_unit claude-jarvis-watcher.service.example)"
     echo "Installing /etc/systemd/system/$WATCHER_SERVICE_NAME (sudo required)"
-    sudo install -m 0644 "$WATCHER_UNIT_FILE" "/etc/systemd/system/$WATCHER_SERVICE_NAME"
-    rm -f "$WATCHER_UNIT_FILE"
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now "$WATCHER_SERVICE_NAME"
+    as_root install -m 0644 "$UNIT_FILE" "/etc/systemd/system/$WATCHER_SERVICE_NAME"
+    rm -f "$UNIT_FILE"
+    as_root systemctl daemon-reload
+    as_root systemctl enable --now "$WATCHER_SERVICE_NAME"
 fi
 
 echo
-sudo systemctl --no-pager --full status "$QUEUE_SERVICE_NAME" "$WATCHER_SERVICE_NAME" || true
+as_root systemctl --no-pager --full status "$QUEUE_SERVICE_NAME" "$WATCHER_SERVICE_NAME" || true
 echo
 if [[ -n "$INSTANCE_ID" && -n "$RELAY_TOKEN" ]]; then
-    echo "Backend ready. Upload claude_ask.py to the Telethon userbot, reply .lm, then run:"
+    echo "Backend ready. Upload claude_ask.py to the Telethon userbot, reply .lm, then run"
+    echo "(in a private chat - the token is shown once and stored nowhere in plaintext"
+    echo "except this worker's own $WORKER_TOKEN_ENV):"
     echo "  .asknet token $RELAY_TOKEN"
     echo "  .asknet local $INSTANCE_ID"
 else
-    echo "Backend ready. Upload claude_ask.py to the Telethon userbot and reply .lm,"
-    echo "then configure it with .asknet once you have a relay token (see README)."
+    echo "Backend installed. Re-run setup.sh with an instance ID to register one, then"
+    echo "upload claude_ask.py to the Telethon userbot, reply .lm and configure .asknet."
 fi
 
 # --- optional: graphify code-map -------------------------------------------

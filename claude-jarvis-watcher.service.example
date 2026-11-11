@@ -6,19 +6,21 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+UMask=0077
 User=__USER__
 WorkingDirectory=__INSTALL_DIR__
-Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=__HOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Optional: owner name/id for the persona template, and chats where the
 # persona's profanity is suppressed. Written by setup.sh; '-' = ok if absent.
 EnvironmentFile=-__INSTALL_DIR__/jarvis.env
-# JARVIS_RELAY_TOKEN (one instance) or JARVIS_RELAY_TOKENS_JSON (many
-# instances) in this root-owned EnvironmentFile authenticates the local
-# Telegram MCP client to cmd_queue.py. Written by setup.sh; '-' = ok if absent.
-EnvironmentFile=-/etc/jarvis-ask/relay-token.env
+# JARVIS_RELAY_TOKENS_JSON (instance_id -> token) authenticates this worker's
+# Telegram MCP client to the relay. Written by setup.sh, mode 0600; this
+# worker has its own file so another product's setup never overwrites it.
+EnvironmentFile=-__RELAY_CONFIG_DIR__/relay-token-claude.env
+Environment=CLAUDE_BIN=__CLAUDE_BIN__
 Environment=CLAUDE_JARVIS_MCP_CONFIG=__INSTALL_DIR__/mcp_telegram_tools_config.json
-Environment=CLAUDE_JARVIS_ASK_QUEUE=/tmp/jarvisask_ask_queue/
-Environment=CLAUDE_JARVIS_ASK_RESULT=/tmp/jarvisask_ask_result/
+# Must match the relay's JARVIS_STATE_DIR: the queues are shared files.
+Environment=JARVIS_STATE_DIR=__STATE_DIR__
 Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
 Environment=JARVIS_TELEGRAM_MCP_PATH=__JARVIS_TELEGRAM_MCP_PATH__
 ExecStart=__VENV_PYTHON__ -u __INSTALL_DIR__/claude_watcher.py

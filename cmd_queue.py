@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command + Ask + OCR queue for jarvis-ask."""
+"""Authenticated HTTP queue relay shared by ClaudeAsk and CodexAsk."""
 
 import json
 import os
@@ -43,25 +43,49 @@ def _sessions_enc_file(instance_id):
     # _sessions_file after the 2026-08-04 naming-symmetry fix.
     return os.path.join(_JARVIS_ASK_DIR, f"ask_sessions_{instance_id}.enc")
 
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-QUEUE_FILE = "/tmp/jarvisask_cmd_queue.json"
-RESULT_FILE = "/tmp/jarvisask_cmd_result.json"
+
+def _state_base_dir():
+    """Private runtime state shared by the relay, both workers and the
+    Telegram-action MCP server.
+
+    Deliberately not /tmp: queue items carry chat text and uploaded media, so
+    the tree is created 0700 for the service user and survives tmp cleaners.
+    """
+    base = os.environ.get("JARVIS_STATE_DIR")
+    if not base:
+        base = os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+            "telegram-ai",
+        )
+    return os.path.abspath(os.path.expanduser(base))
+
+
+def _state_dir(env_name, leaf):
+    """One state subdirectory; an explicit per-directory override still wins."""
+    override = os.environ.get(env_name)
+    if override:
+        path = override
+    else:
+        base = _state_base_dir()
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        os.chmod(base, 0o700)
+        path = os.path.join(base, leaf)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
 # Per-request_id files (not single shared files) -- claude_watcher.py now
 # processes multiple .ask calls concurrently (one thread per chat), so a
 # single shared queue/result file would let concurrent requests clobber
 # each other's state.
-ASK_QUEUE_DIR = os.environ.get("JARVIS_ASK_QUEUE_DIR", "/tmp/jarvisask_ask_queue/")
-ASK_RESULT_DIR = os.environ.get("JARVIS_ASK_RESULT_DIR", "/tmp/jarvisask_ask_result/")
-os.makedirs(ASK_QUEUE_DIR, exist_ok=True)
-os.makedirs(ASK_RESULT_DIR, exist_ok=True)
+ASK_QUEUE_DIR = _state_dir("JARVIS_ASK_QUEUE_DIR", "ask_queue")
+ASK_RESULT_DIR = _state_dir("JARVIS_ASK_RESULT_DIR", "ask_result")
 # CodexAsk uses a separate queue so Claude and Codex workers can never race
 # to claim each other's requests. The HTTP server remains shared because it
 # is transport infrastructure, not a model backend.
-XASK_QUEUE_DIR = os.environ.get("JARVIS_XASK_QUEUE_DIR", "/tmp/jarvisask_xask_queue/")
-XASK_RESULT_DIR = os.environ.get("JARVIS_XASK_RESULT_DIR", "/tmp/jarvisask_xask_result/")
-XASK_RESET_DIR = os.environ.get("JARVIS_XASK_RESET_DIR", "/tmp/jarvisask_xask_reset/")
-for _path in (XASK_QUEUE_DIR, XASK_RESULT_DIR, XASK_RESET_DIR):
-    os.makedirs(_path, exist_ok=True)
+XASK_QUEUE_DIR = _state_dir("JARVIS_XASK_QUEUE_DIR", "xask_queue")
+XASK_RESULT_DIR = _state_dir("JARVIS_XASK_RESULT_DIR", "xask_result")
+XASK_RESET_DIR = _state_dir("JARVIS_XASK_RESET_DIR", "xask_reset")
 
 # Real tool-call relay (2026-08-11), opposite direction from /ask: a local
 # MCP server (mcp_group_tools.py, spawned by `claude -p --mcp-config=...`
@@ -71,10 +95,8 @@ for _path in (XASK_QUEUE_DIR, XASK_RESULT_DIR, XASK_RESET_DIR):
 # action, and posts the result to /tool_call_result. Per-request_id files,
 # same reasoning as ASK_QUEUE_DIR/ASK_RESULT_DIR -- concurrent tool calls
 # (e.g. two different chats both mid-.ask) must not clobber each other.
-TOOL_QUEUE_DIR = os.environ.get("JARVIS_TOOL_QUEUE_DIR", "/tmp/jarvisask_tool_queue/")
-TOOL_RESULT_DIR = os.environ.get("JARVIS_TOOL_RESULT_DIR", "/tmp/jarvisask_tool_result/")
-os.makedirs(TOOL_QUEUE_DIR, exist_ok=True)
-os.makedirs(TOOL_RESULT_DIR, exist_ok=True)
+TOOL_QUEUE_DIR = _state_dir("JARVIS_TOOL_QUEUE_DIR", "tool_queue")
+TOOL_RESULT_DIR = _state_dir("JARVIS_TOOL_RESULT_DIR", "tool_result")
 _TOOL_QUEUE_LOCK = threading.Lock()
 TOOL_CLAIM_LEASE_S = float(os.environ.get("JARVIS_TOOL_CLAIM_LEASE_S", "45"))
 TOOL_TIMEOUT_S = float(os.environ.get("JARVIS_TOOL_TIMEOUT_S", "30"))
@@ -88,8 +110,36 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # never written to this repository or to a queue item.
 RELAY_TOKENS = {}
 RELAY_OWNER_IDS = {}
-RELAY_STATE_DIR = os.environ.get("JARVIS_RELAY_STATE_DIR", "/tmp/jarvisask_relay_state")
-ARTIFACT_DIR = os.environ.get("JARVIS_RELAY_ARTIFACT_DIR", "/tmp/jarvisask_artifacts")
+RELAY_STATE_DIR = _state_dir("JARVIS_RELAY_STATE_DIR", "relay_state")
+ARTIFACT_DIR = _state_dir("JARVIS_RELAY_ARTIFACT_DIR", "artifacts")
+
+
+def _relay_config_dir():
+    """Where the token and owner maps live unless a file is named explicitly."""
+    base = os.environ.get("JARVIS_RELAY_CONFIG_DIR")
+    if not base:
+        base = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+            "telegram-ai",
+        )
+    return os.path.abspath(os.path.expanduser(base))
+
+
+def _relay_tokens_file():
+    return os.environ.get("JARVIS_RELAY_TOKENS_FILE") or os.path.join(
+        _relay_config_dir(), "relay-tokens.json")
+
+
+def _relay_owners_file():
+    return os.environ.get("JARVIS_RELAY_OWNERS_FILE") or os.path.join(
+        _relay_config_dir(), "relay-owners.json")
+
+
+# (tokens mtime_ns, owners mtime_ns) of the maps currently loaded, so a token
+# or owner added by setup takes effect without restarting the relay (a restart
+# would drop every request in flight).
+_RELAY_CONFIG_STAMP = None
+_RELAY_CONFIG_LOCK = threading.Lock()
 
 
 def _load_mapping(path, label):
@@ -105,10 +155,21 @@ def _load_mapping(path, label):
     return data
 
 
+def _relay_config_stamp():
+    try:
+        return (
+            os.stat(_relay_tokens_file()).st_mtime_ns,
+            os.stat(_relay_owners_file()).st_mtime_ns,
+        )
+    except OSError:
+        return None
+
+
 def _load_relay_config():
-    global RELAY_TOKENS, RELAY_OWNER_IDS
-    tokens = _load_mapping(os.environ.get("JARVIS_RELAY_TOKENS_FILE"), "JARVIS_RELAY_TOKENS_FILE")
-    owners = _load_mapping(os.environ.get("JARVIS_RELAY_OWNERS_FILE"), "JARVIS_RELAY_OWNERS_FILE")
+    global RELAY_TOKENS, RELAY_OWNER_IDS, _RELAY_CONFIG_STAMP
+    stamp = _relay_config_stamp()
+    tokens = _load_mapping(_relay_tokens_file(), "JARVIS_RELAY_TOKENS_FILE")
+    owners = _load_mapping(_relay_owners_file(), "JARVIS_RELAY_OWNERS_FILE")
     checked_tokens = {}
     for digest, instance_id in tokens.items():
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -120,6 +181,24 @@ def _load_relay_config():
         checked_tokens[digest] = instance_id
     RELAY_TOKENS = checked_tokens
     RELAY_OWNER_IDS = {str(key): str(value) for key, value in owners.items()}
+    _RELAY_CONFIG_STAMP = stamp
+
+
+def _reload_relay_config_if_changed():
+    """Pick up an edited token/owner map. A half-written or invalid edit keeps
+    the maps already in memory rather than locking every instance out."""
+    if _RELAY_CONFIG_STAMP is None:
+        return  # maps were injected directly (tests) or never loaded from disk
+    stamp = _relay_config_stamp()
+    if stamp is None or stamp == _RELAY_CONFIG_STAMP:
+        return
+    with _RELAY_CONFIG_LOCK:
+        if stamp == _RELAY_CONFIG_STAMP:
+            return
+        try:
+            _load_relay_config()
+        except RuntimeError as exc:
+            print(f"cmd_queue: relay config reload skipped: {exc}", file=sys.stderr, flush=True)
 
 
 def _atomic_json(path, data):
@@ -454,37 +533,6 @@ def classify_semantic_codex(text: str, condition: str, instance_id: str, timeout
     return CLASSIFY_UNAVAILABLE
 
 
-def ocr_image(b64: str, question: str = "Извлеки весь текст с этого изображения.") -> str | None:
-    """OCR via OpenRouter vision model"""
-    if not OPENROUTER_KEY:
-        return "OCR unavailable: OPENROUTER_API_KEY is not configured"
-    try:
-        data = json.dumps({
-            "model": "openai/gpt-4o-mini",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": question},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]
-            }],
-            "max_tokens": 1000,
-        }).encode()
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions",
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            result = json.loads(r.read())
-        return result["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"OCR error: {e}"
-
-
 def _multipart_file_part(content_type, raw):
     """Return one multipart part's headers and exact payload bytes.
 
@@ -554,7 +602,7 @@ class Queue(BaseHTTPRequestHandler):
                 return
             fname = fname[:180]
             outbox = os.path.join(ARTIFACT_DIR, instance_id, "uploads")
-            os.makedirs(outbox, exist_ok=True)
+            os.makedirs(outbox, mode=0o700, exist_ok=True)
             save_path = os.path.join(outbox, f"{uuid.uuid4().hex}_{fname}")
             with open(save_path, "wb") as f:
                 f.write(file_data)
@@ -564,15 +612,7 @@ class Queue(BaseHTTPRequestHandler):
 
         body = self._body()
 
-        if self.path == "/cmd":
-            _atomic_json(QUEUE_FILE, {"cmd": body.get("cmd", ""), "ts": time.time()})
-            self._json({"status": "queued"})
-
-        elif self.path == "/result":
-            _atomic_json(RESULT_FILE, body)
-            self._json({"status": "ok"})
-
-        elif self.path in ("/ask", "/xask"):
+        if self.path in ("/ask", "/xask"):
             if not self._body_instance_is_current(body, instance_id):
                 return
             req_id = body.get("request_id", "")
@@ -667,15 +707,6 @@ class Queue(BaseHTTPRequestHandler):
                 return
             _ack_tool_result(req_id, body.get("result", ""))
             self._json({"status": "ok"})
-
-        elif self.path == "/ocr":
-            image_b64 = body.get("image", "")
-            question = body.get("question", "Извлеки весь текст с этого изображения.")
-            if image_b64:
-                text = ocr_image(image_b64, question)
-                self._json({"text": text})
-            else:
-                self._json({"text": None})
 
         elif self.path == "/classify":
             if not self._body_instance_is_current(body, instance_id):
@@ -796,6 +827,9 @@ class Queue(BaseHTTPRequestHandler):
                 return
             self._json({"status": "ok"})
 
+        else:
+            self._error(404, "Неизвестный endpoint")
+
     def do_GET(self):
         instance_id = self._authenticate()
         if instance_id is None:
@@ -849,24 +883,7 @@ class Queue(BaseHTTPRequestHandler):
                 self._error(404, "Артефакт не найден")
             return
 
-        if self.path == "/cmd":
-            if os.path.exists(QUEUE_FILE):
-                with open(QUEUE_FILE) as f:
-                    cmd = json.load(f)
-                os.remove(QUEUE_FILE)
-                self._json(cmd)
-            else:
-                self._json({"cmd": None})
-
-        elif self.path == "/result":
-            if os.path.exists(RESULT_FILE):
-                with open(RESULT_FILE) as f:
-                    result = json.load(f)
-                self._json(result)
-            else:
-                self._json({"stdout": "", "stderr": "", "rc": -1})
-
-        elif self.path.startswith("/persona") or self.path.startswith("/xpersona"):
+        if self.path.startswith("/persona") or self.path.startswith("/xpersona"):
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             if not self._query_instance_is_current(params, instance_id):
@@ -929,6 +946,9 @@ class Queue(BaseHTTPRequestHandler):
                     pass
             self._json({"done": False, "result": None})
 
+        else:
+            self._error(404, "Неизвестный endpoint")
+
     _MAX_JSON_BODY = 1 * 1024 * 1024  # every JSON endpoint here takes small bodies
 
     def _body(self):
@@ -949,6 +969,7 @@ class Queue(BaseHTTPRequestHandler):
         return parsed if isinstance(parsed, dict) else {}
 
     def _authenticate(self):
+        _reload_relay_config_if_changed()
         value = self.headers.get("Authorization", "")
         if not value.startswith("Bearer ") or not value[7:]:
             self._error(401, "Требуется Authorization: Bearer <token>")
@@ -1014,27 +1035,131 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
-def _add_token(instance_id):
-    if not _safe_instance_id(instance_id):
-        raise RuntimeError("Некорректный instance_id")
-    path = os.environ.get("JARVIS_RELAY_TOKENS_FILE")
-    if not path:
-        raise RuntimeError("JARVIS_RELAY_TOKENS_FILE не задан")
+def _read_mapping_for_edit(path, label):
     try:
         with open(path, encoding="utf-8") as handle:
             entries = json.load(handle)
     except FileNotFoundError:
-        entries = {}
+        return {}
     except (OSError, ValueError) as exc:
-        raise RuntimeError(f"Не удалось прочитать tokens-файл: {exc}") from exc
+        raise RuntimeError(f"{label}: не удалось прочитать {path}: {exc}") from exc
     if not isinstance(entries, dict):
-        raise RuntimeError("tokens-файл должен быть JSON-объектом")
-    token = secrets.token_urlsafe(32)
-    entries[hashlib.sha256(token.encode("utf-8")).hexdigest()] = instance_id
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        raise RuntimeError(f"{label}: файл {path} должен быть JSON-объектом")
+    return entries
+
+
+def _write_private_mapping(path, entries):
+    """Atomically replace a token/owner map, readable only by the relay user.
+
+    The relay runs unprivileged, so a map written by root would lock it out;
+    when invoked as root, hand the file to whoever owns its directory.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
     _atomic_json(path, entries)
     os.chmod(path, 0o600)
+    if os.geteuid() == 0:
+        owner = os.stat(directory)
+        os.chown(path, owner.st_uid, owner.st_gid)
+
+
+def _add_token(instance_id):
+    if not _safe_instance_id(instance_id):
+        raise RuntimeError("Некорректный instance_id")
+    path = _relay_tokens_file()
+    entries = _read_mapping_for_edit(path, "JARVIS_RELAY_TOKENS_FILE")
+    token = secrets.token_urlsafe(32)
+    entries[hashlib.sha256(token.encode("utf-8")).hexdigest()] = instance_id
+    _write_private_mapping(path, entries)
     return token
+
+
+def _merge_worker_token(env_file, instance_id, token):
+    """Record a worker's own token in its systemd EnvironmentFile.
+
+    The file carries JARVIS_RELAY_TOKENS_JSON, an instance_id -> token map, so
+    one worker can serve several instances; other lines are left untouched.
+    """
+    env_file = os.path.abspath(os.path.expanduser(env_file))
+    key = "JARVIS_RELAY_TOKENS_JSON="
+    lines, tokens = [], {}
+    try:
+        with open(env_file, encoding="utf-8") as handle:
+            for line in handle.read().splitlines():
+                if line.startswith(key):
+                    try:
+                        loaded = json.loads(line[len(key):])
+                    except ValueError:
+                        loaded = {}
+                    if isinstance(loaded, dict):
+                        tokens.update(loaded)
+                elif line.startswith("JARVIS_RELAY_TOKEN="):
+                    continue  # superseded by the map, which wins per instance
+                else:
+                    lines.append(line)
+    except FileNotFoundError:
+        pass
+    tokens[instance_id] = token
+    lines.append(key + json.dumps(tokens))
+    directory = os.path.dirname(env_file)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, env_file)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    if os.geteuid() == 0:
+        owner = os.stat(directory)
+        os.chown(env_file, owner.st_uid, owner.st_gid)
+
+
+def _set_owner(instance_id, owner_id):
+    if not _safe_instance_id(instance_id):
+        raise RuntimeError("Некорректный instance_id")
+    if not re.fullmatch(r"[0-9]{1,20}", str(owner_id)):
+        raise RuntimeError("Telegram ID владельца должен быть числом")
+    path = _relay_owners_file()
+    entries = _read_mapping_for_edit(path, "JARVIS_RELAY_OWNERS_FILE")
+    entries[instance_id] = int(owner_id)
+    _write_private_mapping(path, entries)
+
+
+def _revoke_tokens(instance_id):
+    """Drop every token of one instance; returns how many were removed."""
+    if not _safe_instance_id(instance_id):
+        raise RuntimeError("Некорректный instance_id")
+    path = _relay_tokens_file()
+    entries = _read_mapping_for_edit(path, "JARVIS_RELAY_TOKENS_FILE")
+    kept = {digest: value for digest, value in entries.items() if value != instance_id}
+    removed = len(entries) - len(kept)
+    if removed:
+        _write_private_mapping(path, kept)
+    return removed
+
+
+def _list_instances():
+    """Human-readable summary; never prints a token or a full digest."""
+    tokens = _read_mapping_for_edit(_relay_tokens_file(), "JARVIS_RELAY_TOKENS_FILE")
+    owners = _read_mapping_for_edit(_relay_owners_file(), "JARVIS_RELAY_OWNERS_FILE")
+    lines = []
+    for instance_id in sorted(set(tokens.values()) | set(owners)):
+        count = sum(1 for value in tokens.values() if value == instance_id)
+        lines.append(f"{instance_id}\towner={owners.get(instance_id, '-')}\ttokens={count}")
+    return "\n".join(lines) or "(no instances)"
+
+
+_USAGE = (
+    "Использование: cmd_queue.py [--check-config | --list | "
+    "--add-token <instance_id> [--worker-env <file>] | "
+    "--set-owner <instance_id> <telegram_id> | --revoke-tokens <instance_id>]"
+)
 
 
 def _bind_addresses():
@@ -1047,13 +1172,26 @@ def _bind_addresses():
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv[:1] == ["--add-token"]:
-        if len(argv) != 2:
-            raise RuntimeError("Использование: cmd_queue.py --add-token <instance_id>")
-        print(_add_token(argv[1]))  # printed once; only its hash is persisted
+    command = argv[0] if argv else ""
+    if command == "--add-token" and (
+        len(argv) == 2 or (len(argv) == 4 and argv[2] == "--worker-env")
+    ):
+        token = _add_token(argv[1])
+        if len(argv) == 4:
+            _merge_worker_token(argv[3], argv[1], token)
+        print(token)  # printed once; the relay itself persists only its hash
+        return 0
+    if command == "--set-owner" and len(argv) == 3:
+        _set_owner(argv[1], argv[2])
+        return 0
+    if command == "--revoke-tokens" and len(argv) == 2:
+        print(_revoke_tokens(argv[1]))
+        return 0
+    if command == "--list" and len(argv) == 1:
+        print(_list_instances())
         return 0
     if argv not in ([], ["--check-config"]):
-        raise RuntimeError("Использование: cmd_queue.py [--check-config | --add-token <instance_id>]")
+        raise RuntimeError(_USAGE)
     _load_relay_config()
     if argv == ["--check-config"]:
         print("relay configuration OK")

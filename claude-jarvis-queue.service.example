@@ -6,17 +6,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+UMask=0077
 User=__USER__
 WorkingDirectory=__INSTALL_DIR__
-Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=__HOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Optional: owner name/id for the persona template, and chats where the
 # persona's profanity is suppressed. Written by setup.sh; '-' = ok if absent.
 EnvironmentFile=-__INSTALL_DIR__/jarvis.env
 Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
-# Required relay auth configuration. Keep both JSON files outside the checkout
-# and mode 0600; token values themselves never appear in either file here.
-Environment=JARVIS_RELAY_TOKENS_FILE=/etc/jarvis-ask/relay-tokens.json
-Environment=JARVIS_RELAY_OWNERS_FILE=/etc/jarvis-ask/relay-owners.json
+# relay-tokens.json (sha256(token) -> instance) and relay-owners.json
+# (instance -> Telegram owner id) live here, mode 0600, owned by this user.
+# Edits are picked up without a restart.
+Environment=JARVIS_RELAY_CONFIG_DIR=__RELAY_CONFIG_DIR__
+# Queues, uploads and request manifests: private to this user, never /tmp.
+Environment=JARVIS_STATE_DIR=__STATE_DIR__
 Environment=JARVIS_RELAY_BIND=127.0.0.1
 ExecStart=__VENV_PYTHON__ -u __INSTALL_DIR__/cmd_queue.py
 Restart=always
