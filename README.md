@@ -14,13 +14,10 @@ Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude Co
 
 ClaudeAsk is a module for a Telegram **userbot** (your own account, automated) plus a Claude Code backend on your server. In any chat you write `.ask what does this error mean?` — your message turns into a live progress view and then into the answer, as if you had typed it yourself. There is no separate bot to talk to: it lives in the conversations you already have.
 
-```mermaid
-flowchart LR
-    C["Any chat<br/>.ask …"] --> U["ClaudeAsk module<br/>(your userbot)"]
-    U <--> R["Queue relay"]
-    R <--> W["Claude Code<br/>on your server"]
-    W -. "Telegram actions" .-> R -.-> U
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img alt="In any chat .ask goes to your userbot's ClaudeAsk module, which talks to telegram-ai-core's queue relay on your server; the Claude worker runs Claude Code with a resumable session per chat; Telegram actions go through the Telegram actions MCP back to your userbot, which performs them in your account." src="docs/architecture-light.svg" width="860">
+</picture>
 
 It runs on your Claude subscription through the official Claude Code CLI. The backend never holds your Telegram account: when Claude wants to *do* something in Telegram, the request goes back to your userbot, which performs it and reports the real result.
 
