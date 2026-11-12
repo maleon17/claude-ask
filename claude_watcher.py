@@ -367,7 +367,7 @@ SYSTEM_PROMPTS = {
     # routed through any external API (OpenRouter etc): the whole reason
     # this project runs on `claude -p` subscription auth instead of metered
     # API billing is to avoid paying per token anywhere in the pipeline.
-    # This mode is always called with model="haiku" (see call_llm) and no
+    # This mode is always called with CLASSIFY_MODEL (see call_llm) and no
     # session resume -- a stateless, cheap, same-subscription classify call.
     # 3-way, not yes/no -- load-bearing for the "verify" trigger gate
     # (claude_ask.py's _resolve_verified_action): a confident да/нет acts
@@ -385,10 +385,11 @@ SYSTEM_PROMPTS = {
         "для перестраховки."
     ),
 }
-# Model alias used for Tier 1 classify calls -- cheapest/fastest tier,
-# never the default (chat/search/translate use whatever model the
-# subscription's normally configured for).
-CLASSIFY_MODEL = "haiku"
+# Model used for Tier 1 classify calls -- cheapest/fastest tier, never the
+# default (chat/search/translate use whatever model the subscription's
+# normally configured for). An explicit id rather than the "haiku" alias,
+# which a given Claude Code release may still map to an older Haiku.
+CLASSIFY_MODEL = os.environ.get("CLAUDE_JARVIS_CLASSIFY_MODEL", "claude-haiku-5-5")
 
 def _load_sessions(instance_id: str) -> dict:
     path = _sessions_file(instance_id)

@@ -152,7 +152,7 @@ Settings survive module updates. `claude_ask.py` is generated from a template in
 
 - **Voice transcription** uses Mistral's Voxtral API: put a key into `.cfg ClaudeAsk` → `mistral_api_key`.
 - **Persona**: `personas/<instance>.md` on the server (git-ignored), re-read automatically; the template is `personas/default.md.example`.
-- **`jarvis.env`**: owner name and ID for the persona, chats where profanity is off (`JARVIS_NOMATS_CHAT_IDS`), the primary instance.
+- **`jarvis.env`**: owner name and ID for the persona, chats where profanity is off (`JARVIS_NOMATS_CHAT_IDS`), the primary instance, the trigger classifier model (`CLAUDE_JARVIS_CLASSIFY_MODEL`, default `claude-haiku-5-5`).
 - **Relay credentials, state directory, registry**: see [telegram-ai-core](https://github.com/maleon17/telegram-ai-core).
 - **Unattended install**: every `setup.sh` question can be answered through the environment — the variables are listed at the top of the script.
 
