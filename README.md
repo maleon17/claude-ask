@@ -1,59 +1,45 @@
+<div align="center">
+
 # ClaudeAsk
 
-> Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude/Codex from dedicated bots or directly inside your Telegram account.
+**Claude inside your own Telegram chats — type `.ask`, and the answer appears in place of your message.**
 
-**Invoke Claude from an ordinary Telegram conversation, as your own account.**
+[Install](#install) · [Commands](#commands) · [Triggers](#triggers-the-assistant-that-watches-a-chat) · [Remote userbot](#userbot-on-another-server) · [Troubleshooting](#troubleshooting)
 
-ClaudeAsk combines a Telethon/Hikka userbot module with a Claude Code worker and resumable per-chat sessions. Type `.ask` in a chat, the backend does the work, and the loaded module can use your live Telegram session for real actions such as reading history, searching chats, sending files or managing supported conversation workflows.
+Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude Code and Codex from Telegram, on your own subscription.
 
-This is deliberately different from **[claude-telegram-bridge](https://github.com/maleon17/claude-telegram-bridge)**: there is no separate bot conversation acting as the UI. ClaudeAsk lives inside the conversations you already use.
+</div>
 
-## How it works
+---
+
+ClaudeAsk is a module for a Telegram **userbot** (your own account, automated) plus a Claude Code backend on your server. In any chat you write `.ask what does this error mean?` — your message turns into a live progress view and then into the answer, as if you had typed it yourself. There is no separate bot to talk to: it lives in the conversations you already have.
 
 ```mermaid
 flowchart LR
-    C["Telegram chat<br/>.ask"] --> U["ClaudeAsk<br/>Telethon module"]
-    U --> R["Authenticated<br/>queue relay"]
-    R --> W["Claude Code worker<br/>resumable sessions"]
-    W --> R --> U
-    W --> M["Telegram actions MCP"]
-    M --> R --> U
-    U <--> T["Live Telethon session"]
+    C["Any chat<br/>.ask …"] --> U["ClaudeAsk module<br/>(your userbot)"]
+    U <--> R["Queue relay"]
+    R <--> W["Claude Code<br/>on your server"]
+    W -. "Telegram actions" .-> R -.-> U
 ```
 
-The important trust boundary is intentional: **the backend does not own your Telegram account**. Telegram actions are queued back to the module that holds the live Telethon session. The action gets a real result before the agent can treat it as completed.
+It runs on your Claude subscription through the official Claude Code CLI. The backend never holds your Telegram account: when Claude wants to *do* something in Telegram, the request goes back to your userbot, which performs it and reports the real result.
 
-## What is included
+> Looking for a dedicated bot chat instead? That is **[Claude Telegram Bridge](https://github.com/maleon17/claude-telegram-bridge)**. Prefer Codex? **[CodexAsk](https://github.com/maleon17/codex-ask)** is the same thing with `.xask` — both can run side by side.
 
-- `claude_watcher.py` — Claude Code backend worker with resumable sessions
-- `claude_ask.py` — the loadable userbot module (generated; see below)
-- `personas/` — the persona template
-- `setup.sh` and the service example — backend installation
+## What it can do
 
-The queue relay, the Telegram-action MCP server and the source of the userbot module live in **[telegram-ai-core](https://github.com/maleon17/telegram-ai-core)**, shared with [CodexAsk](https://github.com/maleon17/codex-ask). `setup.sh` fetches it for you. `claude_ask.py` here is built from the template there — do not edit it by hand.
+- **Answers in place**, in private chats and groups, with your chat's history as context.
+- **Real Telegram actions** in your account: read and search chat history, send messages and files, create groups and invite people, manage contacts, forward messages.
+- **Sees attachments**: replies to photos, documents, stickers and voice messages (voice is transcribed).
+- **Remembers each chat** — a resumable Claude session per chat; `.new` starts over.
+- **Triggers** — rules that watch a chat and react on their own (see below).
+- **Stoppable** — `.stop` ends a request that is taking too long.
 
-## Commands
+## Install
 
-- `.ask <question>` — ask Claude
-- `.search <word>` — search the chat and answer
-- `.translate <text>` — translate
-- `.stop` — stop the request in this chat (as a reply to its message: only that one)
-- `.new` — start a fresh Claude context
-- `.persona` — view or replace the persona
-- `.asknet` — connection settings; `.asknet check` verifies them
+**You need:** a Linux server with `systemd`, `git` and Python 3.10+; the [Claude Code CLI](https://claude.com/claude-code) logged in with `claude auth login --claudeai`; and a [Heroku](https://github.com/coddrago/Heroku) userbot — the installer can create one for you in Docker.
 
-Trigger rules live in the shared `ClaudeAsk` namespace, enabling coordination when CodexAsk and the optional `jarvis_ask.py` coordinator are also loaded.
-
-## Setup
-
-Requirements:
-
-- Linux with Python 3.10+ (and its `venv` module), `git`
-- Claude Code CLI authenticated with `claude auth login --claudeai`
-- `systemd` and `sudo` (only to install the service units)
-- a supported Telethon/Hikka userbot; this project targets [Heroku](https://github.com/coddrago/Heroku)
-
-Nothing else from this ecosystem has to be installed first. Heroku may run on the same host or in Docker on a separate host.
+**1. Install the backend:**
 
 ```bash
 git clone https://github.com/maleon17/claude-ask.git
@@ -61,108 +47,126 @@ cd claude-ask
 ./setup.sh
 ```
 
-`setup.sh` does everything on the backend side in one pass:
+The installer fetches the shared [telegram-ai-core](https://github.com/maleon17/telegram-ai-core) next to this folder, starts the queue relay and the Claude worker as services, and asks for:
 
-- finds `telegram-ai-core` next to this checkout, or clones it there, and installs the queue relay from it (a relay that is already running is left alone)
-- writes the persona env (`jarvis.env`), keeping any other keys already in that file
-- registers an owner and generates a relay token for an `instance_id` you choose (1–64 letters/digits/`_`/`-`, starting with a letter or digit), then prints the exact `.asknet` commands to paste into Telegram
-- installs and starts the `jarvis-ask-watcher` service
-- optionally builds the graphify code map
-- optionally builds and starts a local Docker userbot container (Heroku image, first-run Telegram sign-in included), or configures Tailscale on this host for a remote userbot
+- your name and Telegram ID (for the persona — get the ID from [@userinfobot](https://t.me/userinfobot));
+- an **instance ID** — any short name for your userbot, like `mybot`.
 
-Every question can also be answered through environment variables (listed at the top of `setup.sh`), so the install can run unattended.
+At the end it prints the three commands you will paste into Telegram — **copy them now**, the token is shown only once.
 
-The only things it cannot do for you: the Claude Code login itself, and anything that has to happen inside Telegram (loading the module, running `.asknet`, the userbot's own first-time Telegram sign-in if you're not using the Docker option).
+**2. Get a userbot.** The installer's last question offers to create one: answer `1` for a local Docker userbot (you will sign in to Telegram once, right in the terminal), `2` if your userbot runs on another server (see [below](#userbot-on-another-server)), or `n` if you already have one on this server.
 
-### More than one userbot on the same backend
-
-The first instance you register runs on this host's own Claude login. Re-running `setup.sh` with another `instance_id` adds a second userbot (someone else's account): it reuses the running services and gets an isolated Claude configuration directory, so it needs its own login and never spends the first owner's subscription. `setup.sh` prints the exact login command.
-
-## Load the userbot module
-
-Send `claude_ask.py` as a document to the userbot and reply with:
-
-```text
-.lm
-```
-
-Then, in a private chat, run the commands `setup.sh` printed:
+**3. Load the module and connect it.** Send `claude_ask.py` as a file to your **Saved Messages**, reply to it with `.lm`, then in the same private chat run the commands the installer printed:
 
 ```text
 .asknet token <token>
-.asknet local <instance_id>
+.asknet local mybot
 .asknet check
 ```
 
-or, for a backend on another host:
+`.asknet check` should answer ✅. That's it — try `.ask hello` in any chat.
 
-```text
-.asknet tailnet <instance_id> <backend_url>
-```
+> Until the module is configured, every command answers with these setup instructions. All settings are also in the userbot's own editor: `.cfg ClaudeAsk`.
 
-The token is shown once and stored nowhere else in plaintext; if you lost it, re-run `setup.sh` to mint another one for the same instance (older tokens stay valid until revoked). A single userbot can share one `instance_id` between ClaudeAsk and CodexAsk; separate userbots each need their own.
+## Commands
 
-Until it is configured, the module answers every command with these setup instructions instead of guessing a backend. The same settings are available in the userbot's own config editor: `.cfg ClaudeAsk`.
+| Command | What it does |
+|---|---|
+| `.ask <question>` | Ask Claude; reply to a message or file to include it |
+| `.search <word>` | Find messages in this chat and answer about them |
+| `.translate <text>` | Translate into Russian |
+| `.stop` | Stop the running request in this chat (reply to its message to stop just that one) |
+| `.new` | Forget this chat's conversation and start fresh |
+| `.persona` | View or edit the assistant's persona; reply to a file or text to replace it, `.persona reset` to restore |
+| `.asknet` | Connection settings: `token`, `local`, `tailnet`, `custom`, `check`, `testbot` |
 
-### Remote userbot over Tailscale
+## Triggers: the assistant that watches a chat
 
-The **remote userbot container** must also have `tailscale` and `tailscaled` installed and join the same tailnet. Install the package in its Docker image so container recreation does not remove the binaries. For an Ubuntu/Debian-based image, add a build step like this before starting Heroku:
+Ask in plain words — *"in this group, delete ads and messages with buttons"*, *"tell me when Alex replies"*, *"answer Alex for me until the question is settled"* — and Claude registers a trigger: a cheap filter (keywords, links, buttons, any message) plus what to do (notify you, reply, delete, post to a topic, run an agent, or ask you to confirm with buttons). Fuzzy conditions like "is this an ad?" are checked by a small model only for messages that passed the filter. Listing, editing and removing triggers also work in plain words.
 
-```dockerfile
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -fsSL https://tailscale.com/install.sh -o /tmp/tailscale-install.sh \
-    && sh /tmp/tailscale-install.sh \
-    && rm /tmp/tailscale-install.sh
-```
+Triggers run unattended, so they are deliberately limited: by default a trigger may only send a message to the chat it fired in, and it can never hand tasks to other agents.
 
-The Ask module starts `tailscaled` in [userspace networking mode](https://tailscale.com/docs/concepts/userspace-networking) on module load, with an HTTP proxy at `localhost:1056`. It requires a persistent `/data` mount for `/data/tailscale/tailscaled.state`. Set `.asknet tailnet <instance_id> http://<backend-tailnet-ip>:9092` and `.asknet token <token>`, then reload the module so `client_ready` starts the local Tailscale proxy. Run the first interactive login inside that container:
+## Userbot on another server
 
-```bash
-docker exec -it <userbot-container> tailscale --socket=/var/run/tailscale/tailscaled.sock up
-```
+If your userbot runs elsewhere, the two servers talk over [Tailscale](https://tailscale.com):
 
-Open the URL Tailscale prints and approve the device. The module can restart a previously authenticated daemon, but it cannot install Tailscale or perform the first login for you.
+1. On **this** server, answer `2` to the installer's last question — it installs Tailscale, logs this server into your tailnet and lets the relay listen there.
+2. In the **userbot's container**, Tailscale must be installed (add it to its image, so it survives a rebuild):
+   ```dockerfile
+   RUN curl -fsSL https://tailscale.com/install.sh -o /tmp/ts.sh && sh /tmp/ts.sh && rm /tmp/ts.sh
+   ```
+   The container needs a persistent `/data` volume; the module starts Tailscale there on every load.
+3. Connect the module and log the container in once:
+   ```text
+   .asknet token <token>
+   .asknet tailnet mybot http://<this-server-tailnet-ip>:9092
+   ```
+   ```bash
+   docker exec -it <userbot-container> tailscale --socket=/var/run/tailscale/tailscaled.sock up
+   ```
+   Open the printed link to approve the device, then run `.asknet check`.
 
-## Configuration notes
+## Troubleshooting
 
-- Relay credentials, the trust boundary and the runtime state directory are documented in [telegram-ai-core](https://github.com/maleon17/telegram-ai-core#relay-authentication).
-- Voice transcription uses Mistral's Voxtral API. Put the key into the module config (`.cfg ClaudeAsk` → `mistral_api_key`); `/data/mistral_api_key.txt` and the `MISTRAL_API_KEY` environment variable still work as fallbacks.
-- `jarvis.env` holds the owner name/ID for the persona template, chats where profanity is suppressed, and the primary instance.
+| Symptom | What to check |
+|---|---|
+| `.ask` answers with setup instructions | The module is not configured yet: run the `.asknet` commands from the installer |
+| `.asknet check` fails | It names the problem: no route to the backend, a wrong token, or a token of another instance |
+| Stuck on "thinking" | `journalctl -u jarvis-ask-watcher -f` on the server; `.stop` ends the request |
+| Telegram actions do nothing | `journalctl -u jarvis-ask-cmd-queue -f`; the userbot must be online to perform them |
+| Lost the token | Run `./setup.sh` again with the same instance ID — it issues a new one |
 
-## Updating
+<details>
+<summary><b>Several userbots on one backend</b></summary>
+
+Run `./setup.sh` again with another instance ID — for example for a family member's account. It reuses the running services and prints a new token for that userbot. The first instance runs on this server's own Claude login; each additional one gets an isolated Claude configuration and needs its own login (the installer prints the exact command), so nobody spends someone else's subscription.
+
+One userbot can use the same instance ID for both ClaudeAsk and CodexAsk.
+
+</details>
+
+<details>
+<summary><b>Together with the rest of Telegram AI</b></summary>
+
+When other [Telegram AI](https://github.com/maleon17/telegram-ai) parts are installed on the same server, they connect on their own:
+
+- **CodexAsk** shares the relay and the trigger rules; with the `JarvisAsk` coordinator loaded, one message fires one coordinated action instead of two.
+- **Claude / Codex Telegram Bridge**: in your own `.ask` you can hand a bigger task to your coding agent in the bridge (it has your projects and no ten-minute limit) and get its answer back. Only the instance's owner can do this — never a trigger or another person. And in your bridge chat, the agent can act in your Telegram account through this userbot.
+
+</details>
+
+<details>
+<summary><b>Updating</b></summary>
 
 ```bash
 git pull && git -C ../telegram-ai-core pull
-sudo systemctl restart jarvis-ask-watcher     # once no .ask is in flight
+sudo systemctl restart jarvis-ask-watcher   # when no .ask is running
 ```
 
-Reload the module in the userbot with:
+Reload the module in the userbot:
 
 ```text
 .dlm https://raw.githubusercontent.com/maleon17/claude-ask/main/claude_ask.py
 ```
 
-A plain `docker cp` does not reload an already-running module. Settings persist in the userbot database.
+Settings survive module updates. `claude_ask.py` is generated from a template in telegram-ai-core — change it there, not here.
 
-## Verification
+</details>
 
-```bash
-./scripts/run_tests.sh
-systemctl status jarvis-ask-watcher
-journalctl -u jarvis-ask-watcher -f
-```
+<details>
+<summary><b>Settings, files and manual setup</b></summary>
 
-After loading the module, try `.asknet check`, a plain `.ask`, `.stop` on a long one, and at least one request that uses a real Telegram tool such as `list_triggers`, `read_history`, or `search_chat`.
+- **Voice transcription** uses Mistral's Voxtral API: put a key into `.cfg ClaudeAsk` → `mistral_api_key`.
+- **Persona**: `personas/<instance>.md` on the server (git-ignored), re-read automatically; the template is `personas/default.md.example`.
+- **`jarvis.env`**: owner name and ID for the persona, chats where profanity is off (`JARVIS_NOMATS_CHAT_IDS`), the primary instance.
+- **Relay credentials, state directory, registry**: see [telegram-ai-core](https://github.com/maleon17/telegram-ai-core).
+- **Unattended install**: every `setup.sh` question can be answered through the environment — the variables are listed at the top of the script.
 
-The tests here cover the worker; the relay and the userbot module are tested in telegram-ai-core.
+Manual setup: install the relay from telegram-ai-core (`./install_relay.sh`, `./register_instance.sh <instance> <owner_id> ~/.config/telegram-ai/relay-token-claude.env`), then fill in the placeholders of `claude-jarvis-watcher.service.example` and enable it as `jarvis-ask-watcher.service`.
 
-## ClaudeAsk + CodexAsk
+Tests: `./scripts/run_tests.sh` (the worker; the relay and module are tested in telegram-ai-core).
 
-ClaudeAsk and **[CodexAsk](https://github.com/maleon17/codex-ask)** are independent agent backends with separate histories that share the relay and trigger coordination. Install either one alone, or both on the same host: the second `setup.sh` reuses the relay the first one installed.
-
-When both modules and the `jarvis_ask.py` coordinator are loaded, it chooses one trigger action per incoming message. Without it, the modules retain their separate trigger handling.
-
-For the wider picture, see **[Telegram AI](https://github.com/maleon17/telegram-ai)**.
+</details>
 
 ## License
 
