@@ -175,7 +175,8 @@ WORKER_TOKEN_ENV="$RELAY_CONFIG_DIR/relay-token-claude.env"
 
 # Lets the relay serve .persona from this checkout and the neighbours find it.
 core_registry register claude-ask "path=$ROOT" "unit=$WATCHER_SERVICE_NAME" \
-    "persona_dir=$J_PERSONA_DIR" "owner_name=$J_OWNER_NAME" "owner_tg_id=$J_OWNER_TG_ID"
+    "persona_dir=$J_PERSONA_DIR" "owner_name=$J_OWNER_NAME" "owner_tg_id=$J_OWNER_TG_ID" \
+    "sessions_dir=$ROOT/runtime"
 
 echo
 echo "== Relay authentication =="
