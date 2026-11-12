@@ -189,6 +189,13 @@ if [[ -n "$INSTANCE_ID" ]]; then
     [[ -n "$OWNER_TG_ID" ]] || die "owner Telegram ID is required to authorize instance '$INSTANCE_ID'"
 
     RELAY_TOKEN="$("$CORE_DIR/register_instance.sh" "$INSTANCE_ID" "$OWNER_TG_ID" "$WORKER_TOKEN_ENV")"
+    # Recorded so a Telegram bridge can tell which instance this product
+    # serves when one person owns several.
+    SERVED="$(core_registry get claude-ask instances 2>/dev/null || true)"
+    case ",$SERVED," in
+        *",$INSTANCE_ID,"*) ;;
+        *) core_registry register claude-ask "path=$ROOT" "instances=${SERVED:+$SERVED,}$INSTANCE_ID" ;;
+    esac
     # The first instance runs on this host's own Claude login. Any later one
     # is somebody else's userbot: it gets an isolated Claude config directory
     # and its own login, so it never spends the first owner's subscription.

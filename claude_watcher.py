@@ -501,7 +501,10 @@ def run_claude_streaming(
         if config_dir:
             env["CLAUDE_CONFIG_DIR"] = config_dir
         if mcp_config:
-            # Read by mcp_telegram_tools.py (via `claude -p`'s own
+            # delegate_to_bridge can wait several minutes for the other
+            # agent's answer; do not let the CLI's tool timeout cut it short.
+            env.setdefault("MCP_TOOL_TIMEOUT", "700000")
+            # Read by the Telegram-action MCP server (via `claude -p`'s own
             # subprocess tree) so a real tool call knows which chat/
             # instance/forum-topic it's acting for, and which message id to
             # exclude from history reads (the live "🤔 Думаю" placeholder),
