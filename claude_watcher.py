@@ -287,12 +287,100 @@ PERSONA_DIR = os.environ.get(
 _PERSONA_TEMPLATE = os.path.join(PERSONA_DIR, "default.md.example")
 _PERSONA_OWNER_NAME = os.environ.get("JARVIS_OWNER_NAME", "владелец")
 _PERSONA_OWNER_TG_ID = os.environ.get("JARVIS_OWNER_TG_ID", "")
-_PERSONA_FALLBACK = (
-    "Ты — Jarvis, дерзкий ИИ-агент с собственным характером. "
-    "Отвечай на русском, простым HTML. Никогда не называй себя "
-    "языковой моделью и не упоминай компании или модели, на которых работаешь."
-)
-_persona_cache = {}          # instance_id -> (path, mtime, text)
+
+# Interface language of a request: the userbot module sends its `language`
+# setting with every request. It picks the shipped persona template and the
+# language of everything this worker writes itself. A module too old to send
+# one was Russian-only, so that stays the default.
+LANGUAGES = ("en", "ru", "uk", "kk", "de")
+LANGUAGE_NAMES = {"en": "English", "ru": "Russian", "uk": "Ukrainian", "kk": "Kazakh", "de": "German"}
+DEFAULT_LANGUAGE = "ru"
+_TEXTS = {
+    "thinking": {"en": "🧠 Thinking...", "ru": "🧠 Думаю...", "uk": "🧠 Думаю...",
+                 "kk": "🧠 Ойланып жатырмын...", "de": "🧠 Denke nach..."},
+    "result": {"en": "Result", "ru": "Результат", "uk": "Результат", "kk": "Нәтиже", "de": "Ergebnis"},
+    "error": {"en": "Error", "ru": "Ошибка", "uk": "Помилка", "kk": "Қате", "de": "Fehler"},
+    "start_failed": {"en": "Claude error: {error}", "ru": "Ошибка Claude: {error}",
+                     "uk": "Помилка Claude: {error}", "kk": "Claude қатесі: {error}",
+                     "de": "Claude-Fehler: {error}"},
+    "empty_result": {"en": "Empty answer from Claude Code (subtype={subtype}){detail}.",
+                     "ru": "Пустой ответ от Claude Code (subtype={subtype}){detail}.",
+                     "uk": "Порожня відповідь від Claude Code (subtype={subtype}){detail}.",
+                     "kk": "Claude Code бос жауап қайтарды (subtype={subtype}){detail}.",
+                     "de": "Leere Antwort von Claude Code (subtype={subtype}){detail}."},
+    "no_response": {"en": "(no answer)", "ru": "(нет ответа)", "uk": "(немає відповіді)",
+                    "kk": "(жауап жоқ)", "de": "(keine Antwort)"},
+    "worker_error": {"en": "Worker error: {error}", "ru": "Ошибка воркера: {error}",
+                     "uk": "Помилка воркера: {error}", "kk": "Воркер қатесі: {error}",
+                     "de": "Worker-Fehler: {error}"},
+    "queue_error": {"en": "Queue error: {error}", "ru": "Ошибка очереди: {error}",
+                    "uk": "Помилка черги: {error}", "kk": "Кезек қатесі: {error}",
+                    "de": "Warteschlangenfehler: {error}"},
+    "restarted": {"en": "The request was interrupted by a worker restart; the action was not repeated.",
+                  "ru": "Запрос прерван перезапуском worker; действие не повторялось.",
+                  "uk": "Запит перервано перезапуском worker; дію не повторено.",
+                  "kk": "Сұрау worker қайта іске қосылғандықтан үзілді; әрекет қайталанбады.",
+                  "de": "Die Anfrage wurde durch einen Neustart des Workers unterbrochen; die Aktion wurde nicht wiederholt."},
+    "chat_context": {"en": "Context of the current chat:", "ru": "Контекст текущего чата:",
+                     "uk": "Контекст поточного чату:", "kk": "Ағымдағы чаттың контексі:",
+                     "de": "Kontext des aktuellen Chats:"},
+    "user_request": {"en": "User's request:", "ru": "Запрос пользователя:", "uk": "Запит користувача:",
+                     "kk": "Пайдаланушының сұрауы:", "de": "Anfrage des Benutzers:"},
+    "fallback_persona": {
+        "en": "You are Jarvis, a cheeky AI agent with a character of your own. Reply in the language "
+              "of the message you are answering, in simple HTML. Never call yourself a language model "
+              "and never mention the companies or models you run on.",
+        "ru": "Ты — Jarvis, дерзкий ИИ-агент с собственным характером. Отвечай на языке сообщения, "
+              "на которое отвечаешь, простым HTML. Никогда не называй себя языковой моделью и не "
+              "упоминай компании или модели, на которых работаешь.",
+        "uk": "Ти — Jarvis, зухвалий ШІ-агент із власним характером. Відповідай мовою повідомлення, "
+              "на яке відповідаєш, простим HTML. Ніколи не називай себе мовною моделлю і не згадуй "
+              "компанії чи моделі, на яких працюєш.",
+        "kk": "Сен — Jarvis, өз мінезі бар батыл ЖИ-агентсің. Жауап беріп отырған хабарламаның "
+              "тілінде, қарапайым HTML-мен жауап бер. Өзіңді ешқашан тілдік модель деп атама және "
+              "қандай компанияның не модельдің негізінде жұмыс істейтініңді айтпа.",
+        "de": "Du bist Jarvis, ein frecher KI-Agent mit eigenem Charakter. Antworte in der Sprache der "
+              "Nachricht, auf die du antwortest, in einfachem HTML. Bezeichne dich nie als Sprachmodell "
+              "und nenne nie die Firmen oder Modelle, auf denen du läufst.",
+    },
+    "no_mats": {
+        "en": "\n\nIMPORTANT: profanity and obscene language are STRICTLY forbidden in this chat. "
+              "Answer politely and courteously.",
+        "ru": "\n\nВНИМАНИЕ: в этом чате КАТЕГОРИЧЕСКИ запрещён мат и нецензурная лексика. "
+              "Отвечай вежливо и культурно.",
+        "uk": "\n\nУВАГА: у цьому чаті КАТЕГОРИЧНО заборонені лайка та нецензурна лексика. "
+              "Відповідай ввічливо й культурно.",
+        "kk": "\n\nНАЗАР АУДАР: бұл чатта балағат пен әдепсіз сөздерге ҚАТАҢ тыйым салынған. "
+              "Сыпайы және мәдениетті жауап бер.",
+        "de": "\n\nACHTUNG: In diesem Chat sind Schimpfwörter und obszöne Sprache STRENG verboten. "
+              "Antworte höflich und kultiviert.",
+    },
+}
+
+
+def _language(value):
+    return value if value in LANGUAGES else DEFAULT_LANGUAGE
+
+
+def _text(key, language, **values):
+    text = _TEXTS[key].get(_language(language)) or _TEXTS[key]["en"]
+    for name, value in values.items():
+        text = text.replace("{" + name + "}", str(value))
+    return text
+
+
+def _persona_template(language):
+    """The shipped template for a language: default.<lang>.md.example, else
+    default.md.example (English)."""
+    if language != "en":
+        localized = os.path.join(PERSONA_DIR, f"default.{language}.md.example")
+        if os.path.exists(localized):
+            return localized
+    return _PERSONA_TEMPLATE
+
+
+_PERSONA_FALLBACK = _TEXTS["fallback_persona"][DEFAULT_LANGUAGE]
+_persona_cache = {}          # (instance_id, language) -> (path, mtime, text)
 _persona_lock = threading.Lock()
 
 
@@ -318,18 +406,20 @@ def _read_persona_file(path):
         return fh.read(_PERSONA_READ_CAP + 1)
 
 
-def load_persona(instance_id=None):
+def load_persona(instance_id=None, language=None):
     instance_id = instance_id or DEFAULT_INSTANCE
+    language = _language(language)
+    cache_key = (instance_id, language)
     for path in (persona_file(instance_id),
                  os.path.join(PERSONA_DIR, "default.md"),
-                 _PERSONA_TEMPLATE):
+                 _persona_template(language)):
         try:
             st = os.stat(path)
             stamp = (st.st_mtime_ns, st.st_size)
         except OSError:
             continue
         with _persona_lock:
-            cached = _persona_cache.get(instance_id)
+            cached = _persona_cache.get(cache_key)
             if cached and cached[0] == path and cached[1] == stamp:
                 return cached[2]
         try:
@@ -344,24 +434,28 @@ def load_persona(instance_id=None):
         if not text:
             continue  # empty / whitespace-only -> fall through to the next source
         with _persona_lock:
-            _persona_cache[instance_id] = (path, stamp, text)
+            _persona_cache[cache_key] = (path, stamp, text)
         return text
-    return _PERSONA_FALLBACK
+    return _text("fallback_persona", language)
 
-NO_MATS_RULE = (
-    "\n\nВНИМАНИЕ: в этом чате КАТЕГОРИЧЕСКИ запрещён мат и нецензурная "
-    "лексика. Отвечай вежливо и культурно."
-)
+NO_MATS_RULE = _TEXTS["no_mats"][DEFAULT_LANGUAGE]
 
 SYSTEM_PROMPTS = {
+    # {language}: the request's interface language (see _system_prompt).
     "search": (
-        "Ты — Jarvis, поисковый ассистент. Найди информацию по запросу и дай "
-        "краткий ответ на русском, используя HTML. Никогда не говори что ты "
-        "языковая модель или упоминай компании/модели — ты Jarvis, точка."
+        "You are Jarvis, a search assistant. Find information on the request and give "
+        "a short answer in {language}, using HTML. Never say you are a language model "
+        "and never mention companies or models; you are Jarvis, period."
     ),
     "translate": (
-        "Ты — Jarvis, переводчик. Переведи следующий текст на русский. Только "
-        "перевод, без пояснений."
+        "You are Jarvis, a translator. Translate the following text into {language}. "
+        "Only the translation, no explanations."
+    ),
+    # The relay's persona translation (cmd_queue.py, /persona_language): the
+    # instructions and the persona are in the message itself.
+    "persona_translate": (
+        "You are a careful, faithful translator. Follow the instructions in the "
+        "message exactly and output only the translated text."
     ),
     # Phase 4 Tier 1 (trigger semantic classification) -- deliberately NOT
     # routed through any external API (OpenRouter etc): the whole reason
@@ -458,7 +552,7 @@ def run_claude_streaming(
     config_dir: str = None, model: str = None,
     mcp_config: str = None, chat_id: str = None, instance_id: str = None,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
-    request_id: str = None,
+    request_id: str = None, language: str = None, persist: bool = True,
 ):
     """Streams a single `claude -p` turn, calling on_progress(html_text) as
     thoughts/tool calls/results come in. Returns (final_text, thought_history,
@@ -488,6 +582,9 @@ def run_claude_streaming(
         args += ["--resume", session_id]
     if mcp_config:
         args += ["--mcp-config", mcp_config]
+    if not persist:
+        # Nothing to resume later: leave no session file behind.
+        args += ["--no-session-persistence"]
     # Tried enabling a thinking budget (MAX_THINKING_TOKENS) so reasoning-only
     # asks (no tool calls) would have a genuine thinking block to bank too.
     # Reverted: with this persona/prompt shape the model still writes its
@@ -515,6 +612,7 @@ def run_claude_streaming(
             env["INSTANCE_ID"] = str(instance_id or DEFAULT_INSTANCE)
             env["REQUESTER_ID"] = str(requester_id or "")
             env["JARVIS_RELAY_REQUEST_ID"] = str(request_id or "")
+            env["JARVIS_LANGUAGE"] = _language(language)
             if topic_id:
                 env["TOPIC_ID"] = str(topic_id)
             if exclude_id:
@@ -527,7 +625,7 @@ def run_claude_streaming(
             text=True, bufsize=1, env=env, start_new_session=True,
         )
     except Exception as e:
-        return f"[[backend_error:claude_start]] Ошибка Claude: {e}", [], session_id
+        return "[[backend_error:claude_start]] " + _text("start_failed", language, error=e), [], session_id
     if request_id:
         with _RUN_LOCK:
             _RUNNING[request_id] = proc
@@ -570,7 +668,7 @@ def run_claude_streaming(
             for label, content in draft_res_blocks:
                 lines.append(f"{html.escape(label, quote=False)}:")
                 lines.append(f"<pre>{html.escape(content, quote=False)}</pre>")
-        return "\n".join(lines) if lines else "🧠 Думаю..."
+        return "\n".join(lines) if lines else _text("thinking", language)
 
     try:
         for raw_line in proc.stdout:
@@ -657,7 +755,7 @@ def run_claude_streaming(
                                 res_blocks.append(("❌ StdErr", f"Exit code {exit_code}"))
                             else:
                                 icon = "❌" if is_error else "✅"
-                                label = f"{icon} {'Ошибка' if is_error else 'Результат'}"
+                                label = f"{icon} {_text('error' if is_error else 'result', language)}"
                                 res_blocks.append((label, _clean(result_content.strip(), 400)))
                         draft_res_blocks = res_blocks
                         on_progress(render())
@@ -691,9 +789,8 @@ def run_claude_streaming(
                     stale_session = bool(
                         session_id and any("No conversation found" in str(e) for e in errors)
                     )
-                    final_text = (
-                        f"[[backend_error:claude_{subtype}]] Пустой ответ от Claude Code "
-                        f"(subtype={subtype}){': ' + detail if detail else ''}."
+                    final_text = f"[[backend_error:claude_{subtype}]] " + _text(
+                        "empty_result", language, subtype=subtype, detail=(": " + detail) if detail else "",
                     )
                 continue
 
@@ -720,23 +817,29 @@ def run_claude_streaming(
             system_prompt, prompt, on_progress, session_id=None, config_dir=config_dir,
             model=model, mcp_config=mcp_config, chat_id=chat_id, instance_id=instance_id,
             topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id,
-            request_id=request_id,
+            request_id=request_id, language=language, persist=persist,
         )
 
-    return (final_text if final_text is not None else "[[backend_error:claude_no_response]] (нет ответа)"), thought_history, new_session_id
+    if final_text is None:
+        final_text = "[[backend_error:claude_no_response]] " + _text("no_response", language)
+    return final_text, thought_history, new_session_id
 
 
 def call_llm(
     question: str, chat_id: str, mode: str, req_id: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
     owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
+    language: str = None,
 ):
+    language = _language(language)
     if mode == "chat":
-        system = load_persona(instance_id)
+        system = load_persona(instance_id, language)
+    elif mode in SYSTEM_PROMPTS:
+        system = SYSTEM_PROMPTS[mode].replace("{language}", LANGUAGE_NAMES[language])
     else:
-        system = SYSTEM_PROMPTS.get(mode) or load_persona(instance_id)
+        system = load_persona(instance_id, language)
     if str(chat_id) in NOMATS_CHAT_IDS:
-        system += NO_MATS_RULE
+        system += _text("no_mats", language)
 
     # Only "chat" (plain .ask) is a real ongoing conversation worth resuming.
     # "search"/"translate" are one-off utility calls -- keep them stateless
@@ -760,13 +863,14 @@ def call_llm(
     model = CLASSIFY_MODEL if mode == "classify" else None
     mcp_config = MCP_CONFIG_PATH if mode == "chat" else None
     prompt = (
-        f"Контекст текущего чата:\n{chat_context.strip()}\n\nЗапрос пользователя:\n{question}"
+        f"{_text('chat_context', language)}\n{chat_context.strip()}\n\n{_text('user_request', language)}\n{question}"
         if chat_context and chat_context.strip() else question
     )
     answer, thoughts, new_session_id = run_claude_streaming(
         system, prompt, on_progress, session_id=session_id, config_dir=_config_dir(instance_id), model=model,
         mcp_config=mcp_config, chat_id=chat_id, instance_id=instance_id,
         topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id, request_id=req_id,
+        language=language, persist=mode != "persona_translate",
     )
 
     if mode == "chat" and new_session_id:
@@ -901,6 +1005,7 @@ def _process_request(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
     owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
+    language: str = None,
 ):
     result_path = os.path.join(RESULT_DIR, f"{req_id}.json")
     cancelled_result = {"done": True, "request_id": req_id, "cancelled": True, "answer": "", "thoughts": []}
@@ -912,7 +1017,7 @@ def _process_request(
             answer, thoughts = call_llm(
                 question, chat_id, mode, req_id, instance_id, topic_id=topic_id,
                 exclude_id=exclude_id, requester_id=requester_id, owner_authorized=owner_authorized,
-                chat_context=chat_context, session_chat_id=session_chat_id,
+                chat_context=chat_context, session_chat_id=session_chat_id, language=language,
             )
             print(f"  A: {answer[:80]}...", flush=True)
             _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": answer, "thoughts": thoughts})
@@ -922,7 +1027,7 @@ def _process_request(
         except Exception as e:
             print(f"ERR [{req_id}]: {e}", flush=True)
             try:
-                _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": f"Ошибка воркера: {e}", "thoughts": []})
+                _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": _text("worker_error", language, error=e), "thoughts": []})
             except Exception:
                 pass
         finally:
@@ -933,19 +1038,29 @@ def _process_request_serialized(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
     owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
+    language: str = None,
 ):
     # Stateless utility modes share no resumable session and stay parallel.
     if mode != "chat":
         return _process_request(
             req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
-            owner_authorized, chat_context, session_chat_id,
+            owner_authorized, chat_context, session_chat_id, language,
         )
     session_key_chat = session_chat_id or chat_id
     with _chat_request_lock(instance_id, session_key_chat):
         return _process_request(
             req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
-            owner_authorized, chat_context, session_chat_id,
+            owner_authorized, chat_context, session_chat_id, language,
         )
+
+
+def _queued_language(path):
+    """The language a queued request asked for, when it can still be read."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle).get("language")
+    except Exception:
+        return None
 
 
 def main():
@@ -967,12 +1082,13 @@ def main():
                         req_id, data["question"], data.get("chat_id", "unknown"), data.get("mode", "chat"),
                         data.get("instance_id") or DEFAULT_INSTANCE, data.get("topic_id"), data.get("message_id"),
                         data.get("requester_id"), data.get("owner_authorized", False), data.get("chat_context"),
-                        data.get("session_chat_id"),
+                        data.get("session_chat_id"), data.get("language"),
                     )
             except Exception as exc:
                 req_id = os.path.basename(processing).split(".json", 1)[0]
                 _atomic_json(os.path.join(RESULT_DIR, f"{req_id}.json"), {
-                    "done": True, "request_id": req_id, "answer": f"Ошибка очереди: {exc}", "thoughts": [],
+                    "done": True, "request_id": req_id, "thoughts": [],
+                    "answer": _text("queue_error", _queued_language(processing), error=exc),
                 })
             finally:
                 try:
@@ -991,8 +1107,8 @@ def main():
         if fname.endswith(".json.processing"):
             req_id = fname.split(".json.processing", 1)[0]
             _atomic_json(os.path.join(RESULT_DIR, f"{req_id}.json"), {
-                "done": True, "request_id": req_id,
-                "answer": "Запрос прерван перезапуском worker; действие не повторялось.", "thoughts": [],
+                "done": True, "request_id": req_id, "thoughts": [],
+                "answer": _text("restarted", _queued_language(os.path.join(QUEUE_DIR, fname))),
             })
             try:
                 os.unlink(os.path.join(QUEUE_DIR, fname))

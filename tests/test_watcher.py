@@ -18,7 +18,7 @@ import claude_watcher  # noqa: E402
 
 def test_watcher_places_trigger_context_before_the_request(monkeypatch):
     captured = {}
-    monkeypatch.setattr(claude_watcher, "load_persona", lambda _: "persona")
+    monkeypatch.setattr(claude_watcher, "load_persona", lambda *_: "persona")
     get_session_id = patch.object(claude_watcher, "get_session_id", return_value="thread")
     set_session_id = patch.object(claude_watcher, "set_session_id")
 
@@ -121,7 +121,7 @@ def test_stop_kills_the_running_process_group_and_reports_cancelled(monkeypatch,
     fake_claude.write_text(f"#!/bin/sh\nsleep 60 &\necho $! > {child_pid_file}\nwait\n")
     fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setattr(claude_watcher, "CLAUDE_BIN", str(fake_claude))
-    monkeypatch.setattr(claude_watcher, "load_persona", lambda _: "persona")
+    monkeypatch.setattr(claude_watcher, "load_persona", lambda *_: "persona")
     monkeypatch.setattr(claude_watcher, "get_session_id", lambda *a: None)
     monkeypatch.setattr(claude_watcher, "set_session_id", lambda *a: None)
 
