@@ -39,12 +39,12 @@ It runs on your Claude subscription through the official Claude Code CLI. The ba
 **1. Install the backend:**
 
 ```bash
-git clone https://github.com/maleon17/claude-ask.git
-cd claude-ask
+git clone https://github.com/maleon17/claude-ask.git ~/.claude-ask
+cd ~/.claude-ask
 ./setup.sh
 ```
 
-The installer fetches the shared [telegram-ai-core](https://github.com/maleon17/telegram-ai-core) next to this folder, starts the queue relay and the Claude worker as services, and asks for:
+The installer fetches the shared [telegram-ai-core](https://github.com/maleon17/telegram-ai-core) into a hidden folder next to this one (`~/.telegram-ai-core`), starts the queue relay and the Claude worker as services, and asks for:
 
 - your name and Telegram ID (for the persona — get the ID from [@userinfobot](https://t.me/userinfobot));
 - an **instance ID** — any short name for your userbot, like `mybot`.
