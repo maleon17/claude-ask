@@ -147,7 +147,7 @@ Settings survive module updates. `claude_ask.py` is generated from a template in
 <details>
 <summary><b>Settings, files and manual setup</b></summary>
 
-- **Voice transcription** uses Google AI Studio (Gemini) first and Mistral Voxtral as a fallback. Set `.cfg ClaudeAsk` → `gemini_api_key` (and optionally `gemini_model`, default `gemini-2.5-flash-lite`). Set `mistral_api_key` for fallback or to use Mistral alone when the Gemini key is empty.
+- **Voice transcription** uses Google AI Studio (Gemini) first and Mistral Voxtral as a fallback. Set `.cfg ClaudeAsk` → `gemini_api_key` (and optionally `gemini_model`, default `gemini-3.5-flash-lite`). Set `mistral_api_key` for fallback or to use Mistral alone when the Gemini key is empty.
 - **Language**: `.cfg ClaudeAsk` → `language` (`auto`, `en`, `ru`, `uk`, `kk`, `de`). It switches the module's messages, `.help` and settings descriptions, and the persona: an unedited persona is replaced by the repository's translation (`personas/default.<lang>.md.example`), an edited one is translated by the backend's model, and switching back to its original language restores your text unchanged. `auto` follows the userbot's own language (`.setlang`), otherwise English.
 - **Persona**: `personas/<instance>.md` on the server (git-ignored), re-read automatically; the templates are `personas/default.md.example` (English) and `personas/default.<lang>.md.example`.
 - **`jarvis.env`**: owner name and ID for the persona, chats where profanity is off (`JARVIS_NOMATS_CHAT_IDS`), the primary instance, the trigger classifier model (`CLAUDE_JARVIS_CLASSIFY_MODEL`, default `claude-haiku-5-5`).

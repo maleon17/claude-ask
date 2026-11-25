@@ -1,4 +1,4 @@
-# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl and module/locales (sha256 d250c946b367);
+# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl and module/locales (sha256 064fa4b0564a);
 # change the template there and run module/build.py.
 # ClaudeAsk — .ask .search .translate + Jarvis persona, Claude Code backend
 #
@@ -87,7 +87,7 @@ _LOCALES = {
         "cancelled": "Abgebrochen",
         "cfg_backend_url": "Adresse der Queue (relay) des Backends, zum Beispiel http://127.0.0.1:9092. Einfacher über .asknet zu setzen",
         "cfg_gemini_api_key": "Google AI Studio-Schlüssel (Gemini) zum Transkribieren von Sprachnachrichten. Primär; Mistral als Ersatz. Leer – nur Mistral wird verwendet",
-        "cfg_gemini_model": "Gemini-Modell zum Transkribieren von Sprachnachrichten (Standard: gemini-2.5-flash-lite)",
+        "cfg_gemini_model": "Gemini-Modell zum Transkribieren von Sprachnachrichten (Standard: gemini-3.5-flash-lite)",
         "cfg_http_proxy": "HTTP-Proxy zum relay. Leer – direkte Verbindung; für ein tailnet ohne /dev/net/tun – http://localhost:1056",
         "cfg_instance_id": "Kennung dieses Userbots auf dem Backend (wird von setup.sh ausgegeben)",
         "cfg_language": "Sprache des Moduls und der Jarvis-Persona: auto (wie beim Userbot), en, ru, uk, kk oder de. Beim Wechsel wird die Standard-Persona durch die Übersetzung aus dem Repository ersetzt, eine bearbeitete wird vom Modell übersetzt",
@@ -413,7 +413,7 @@ _LOCALES = {
         "cancelled": "Cancelled",
         "cfg_backend_url": "Address of the backend's queue relay, for example http://127.0.0.1:9092. Easier to set with .asknet",
         "cfg_gemini_api_key": "Google AI Studio (Gemini) key for voice transcription. Primary engine; Mistral is the fallback. Empty means only Mistral is used",
-        "cfg_gemini_model": "Gemini model for voice transcription (default: gemini-2.5-flash-lite)",
+        "cfg_gemini_model": "Gemini model for voice transcription (default: gemini-3.5-flash-lite)",
         "cfg_http_proxy": "HTTP proxy to the relay. Empty means a direct connection; for a tailnet without /dev/net/tun use http://localhost:1056",
         "cfg_instance_id": "This userbot's identifier on the backend (printed by setup.sh)",
         "cfg_language": "Language of the module and of the Jarvis persona: auto (same as the userbot), en, ru, uk, kk or de. On a change the default persona is replaced by the repository's translation; an edited one is translated by the model",
@@ -739,7 +739,7 @@ _LOCALES = {
         "cancelled": "Бас тартылды",
         "cfg_backend_url": "Бэкенд кезегінің (relay) мекенжайы, мысалы http://127.0.0.1:9092. .asknet арқылы орнату жеңілдеу",
         "cfg_gemini_api_key": "Дауыстық хабарламаларды мәтінге айналдыруға арналған Google AI Studio (Gemini) кілті. Негізгі қозғалтқыш; Mistral — қосалқы. Бос болса, тек Mistral қолданылады",
-        "cfg_gemini_model": "Дауыстықтарды мәтінге айналдыруға арналған Gemini моделі (әдепкі: gemini-2.5-flash-lite)",
+        "cfg_gemini_model": "Дауыстықтарды мәтінге айналдыруға арналған Gemini моделі (әдепкі: gemini-3.5-flash-lite)",
         "cfg_http_proxy": "relay-ге дейінгі HTTP-прокси. Бос болса — тікелей байланыс; /dev/net/tun жоқ tailnet үшін — http://localhost:1056",
         "cfg_instance_id": "Бэкендтегі осы юзерботтың идентификаторы (оны setup.sh басып шығарады)",
         "cfg_language": "Модуль мен Jarvis персонасының тілі: auto (юзерботтағы сияқты), en, ru, uk, kk немесе de. Ауысқанда әдепкі персона репозиторийдегі аудармаға ауыстырылады, өзгертілгені модель арқылы аударылады",
@@ -1065,7 +1065,7 @@ _LOCALES = {
         "cancelled": "Отменено",
         "cfg_backend_url": "Адрес очереди (relay) бэкенда, например http://127.0.0.1:9092. Проще задать через .asknet",
         "cfg_gemini_api_key": "Ключ Google AI Studio (Gemini) для расшифровки голосовых. Основной движок; Mistral — запасной. Пусто — используется только Mistral",
-        "cfg_gemini_model": "Модель Gemini для расшифровки голосовых (по умолчанию: gemini-2.5-flash-lite)",
+        "cfg_gemini_model": "Модель Gemini для расшифровки голосовых (по умолчанию: gemini-3.5-flash-lite)",
         "cfg_http_proxy": "HTTP-прокси до relay. Пусто — прямое соединение; для tailnet без /dev/net/tun — http://localhost:1056",
         "cfg_instance_id": "Идентификатор этого юзербота на бэкенде (его печатает setup.sh)",
         "cfg_language": "Язык модуля и персоны Jarvis: auto (как у юзербота), en, ru, uk, kk или de. При смене дефолтная персона заменяется переводом из репозитория, изменённая — переводится моделью",
@@ -1391,7 +1391,7 @@ _LOCALES = {
         "cancelled": "Скасовано",
         "cfg_backend_url": "Адреса черги (relay) бекенда, наприклад http://127.0.0.1:9092. Простіше задати через .asknet",
         "cfg_gemini_api_key": "Ключ Google AI Studio (Gemini) для розшифровки голосових. Основний рушій; Mistral — запасний. Порожньо — використовується лише Mistral",
-        "cfg_gemini_model": "Модель Gemini для розшифровки голосових (за замовчуванням: gemini-2.5-flash-lite)",
+        "cfg_gemini_model": "Модель Gemini для розшифровки голосових (за замовчуванням: gemini-3.5-flash-lite)",
         "cfg_http_proxy": "HTTP-проксі до relay. Порожньо — пряме з'єднання; для tailnet без /dev/net/tun — http://localhost:1056",
         "cfg_instance_id": "Ідентифікатор цього юзербота на бекенді (його друкує setup.sh)",
         "cfg_language": "Мова модуля і персони Jarvis: auto (як у юзербота), en, ru, uk, kk або de. При зміні дефолтна персона замінюється перекладом з репозиторію, змінена — перекладається моделлю",
@@ -2029,7 +2029,7 @@ def _load_mistral_api_key():
 MISTRAL_API_KEY = _load_mistral_api_key()
 MISTRAL_TRANSCRIBE_URL = "https://api.mistral.ai/v1/audio/transcriptions"
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_SYSTEM_INSTRUCTION = (
     "You are a speech transcription engine, not an assistant. Output only a verbatim "
     "transcript of what is spoken in the original language, without translation, "
@@ -2318,7 +2318,7 @@ class ClaudeAsk(loader.Module):
                 on_change=self._apply_config,
             ),
             loader.ConfigValue(
-                "gemini_model", "gemini-2.5-flash-lite",
+                "gemini_model", "gemini-3.5-flash-lite",
                 lambda: _t("cfg_gemini_model"),
                 validator=loader.validators.String(),
                 on_change=self._apply_config,
@@ -2360,7 +2360,7 @@ class ClaudeAsk(loader.Module):
             TEST_CHANNEL_BOT_ID = 0
         MISTRAL_API_KEY = str(config["mistral_api_key"] or "").strip() or _load_mistral_api_key()
         GEMINI_API_KEY = str(config["gemini_api_key"] or "").strip() or _load_gemini_api_key()
-        GEMINI_MODEL = str(config["gemini_model"] or "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+        GEMINI_MODEL = str(config["gemini_model"] or "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite"
 
     # -- Interface language -----------------------------------------------------
 
