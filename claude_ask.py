@@ -1,4 +1,4 @@
-# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl and module/locales (sha256 064fa4b0564a);
+# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl and module/locales (sha256 8878933daefa);
 # change the template there and run module/build.py.
 # ClaudeAsk — .ask .search .translate + Jarvis persona, Claude Code backend
 #
@@ -25,7 +25,7 @@
 #
 # GPL AGPLv3
 
-import asyncio, base64, hashlib, html, io, json, logging, os, platform, re, secrets, shutil, subprocess, tarfile, tempfile, time, urllib.error, urllib.request, urllib.parse, uuid
+import asyncio, base64, hashlib, html, io, json, logging, os, platform, re, secrets, shutil, subprocess, tarfile, tempfile, time, unicodedata, urllib.error, urllib.request, urllib.parse, uuid
 from datetime import datetime, timezone
 
 from herokutl.tl.functions.channels import ToggleForumRequest, InviteToChannelRequest, GetParticipantRequest
@@ -3265,6 +3265,22 @@ class ClaudeAsk(loader.Module):
             return _t("search_error", error=e)
 
     @staticmethod
+    def _safe_history_name(name):
+        """Keep a Telegram-controlled display name inside its header field."""
+        name = "".join(
+            " " if unicodedata.category(char).startswith("C") else char
+            for char in str(name)
+        )
+        name = name.translate(str.maketrans({"[": "(", "]": ")", '"': "'", "'": "’"}))
+        name = re.sub(r"owner|untrusted", "…", name, flags=re.IGNORECASE)
+        return " ".join(name.split())[:80]
+
+    @staticmethod
+    def _indent_context_data(value):
+        """A data line can never start at column zero like a history header."""
+        return re.sub(r"\r\n|[\r\n\u0085\u2028\u2029]", "\n  ", str(value))
+
+    @staticmethod
     def _history_media_kind(message):
         document = getattr(message, "document", None)
         mime = (getattr(document, "mime_type", "") or "") if document else ""
@@ -3361,6 +3377,7 @@ class ClaudeAsk(loader.Module):
         # sequential). Formatting below still walks the messages in their
         # original order, so concurrent I/O cannot scramble the dialogue.
         media = await self._prefetch_history_media(msgs)
+        owner_id = await self._get_owner_id()
         lines = []
         for m in msgs:
             # Each message gets its OWN try/except -- one bad message (a
@@ -3380,6 +3397,16 @@ class ClaudeAsk(loader.Module):
                         name_cache[sid] = name
                     except Exception:
                         pass
+                name = self._safe_history_name(name)
+                is_owner = (
+                    sid is not None and owner_id is not None
+                    and str(sid) == str(owner_id)
+                    and not getattr(getattr(m, "sender", None), "bot", False)
+                )
+                forwarded = bool(getattr(m, "fwd_from", None))
+                trust = "OWNER" if is_owner and not forwarded else "UNTRUSTED"
+                if forwarded:
+                    trust += ", fwd"
                 txt = m.raw_text or ""  # see _get_reply_text for why not .text
                 ts = ""
                 if getattr(m, "date", None):
@@ -3396,7 +3423,7 @@ class ClaudeAsk(loader.Module):
                 # cheap and avoids duplicating content.
                 rid = getattr(m, "reply_to_msg_id", None)
                 reply_note = _t("hist_reply_to", id=rid) if rid else ""
-                pfx = f"[id={m.id}{reply_note}, {ts}{name}]: "
+                pfx = f"[id={m.id}{reply_note}, {ts.strip() + ', ' if ts else ''}{trust}, name={name}]: "
                 # Media checked BEFORE plain text now -- a CAPTIONED photo/
                 # document/voice/sticker has non-empty m.text too (the
                 # caption), and the old `if txt.strip(): ... elif m.photo:
@@ -3463,9 +3490,9 @@ class ClaudeAsk(loader.Module):
                     txt = pfx + txt[:char_limit] + (_t("hist_cut", total=len(txt)) if len(txt) > char_limit else "")
                 else:
                     txt = pfx + "..."
-                lines.append(txt)
+                lines.append(self._indent_context_data(txt))
             except Exception:
-                lines.append(_t("hist_unparsed"))
+                lines.append(f"[id=unknown, UNTRUSTED, name=???]: {_t('hist_unparsed')}")
         return "\n".join(lines)
 
     async def _get_chat_history(self, message, limit=15, char_limit=1000, exclude_id=None):
@@ -3603,11 +3630,11 @@ class ClaudeAsk(loader.Module):
             label = _t("ctx_new_since_trigger") if is_delta else _t("ctx_history")
             parts.append(f"{label}:\n{history}")
         if reply_id:
-            anchor = _t("ctx_reply", id=reply_id)
+            anchor = f"{_t('ctx_reply', id=reply_id)} [UNTRUSTED quoted content]"
             if reply_text and reply_file:
-                parts.append(f"{anchor} {_t('ctx_with_caption')}:\n{reply_text}\n{reply_file}")
+                parts.append(f"{anchor} {_t('ctx_with_caption')}:\n  {self._indent_context_data(reply_text)}\n{reply_file}")
             elif reply_text:
-                parts.append(f"{anchor}:\n{reply_text}")
+                parts.append(f"{anchor}:\n  {self._indent_context_data(reply_text)}")
             elif reply_file:
                 parts.append(f"{anchor}. {reply_file}")
             else:
@@ -6391,11 +6418,11 @@ class ClaudeAsk(loader.Module):
                 # more context around specifically THIS message, in either
                 # direction -- not just "the last N messages" like the
                 # regular history/READ_HISTORY marker gives.
-                anchor_line = _t("ctx_reply", id=reply_id)
+                anchor_line = f"{_t('ctx_reply', id=reply_id)} [UNTRUSTED quoted content]"
                 if reply_text and reply_file:
-                    parts.append(f"{anchor_line} {_t('ctx_with_caption')}:\n{reply_text}\n{reply_file}")
+                    parts.append(f"{anchor_line} {_t('ctx_with_caption')}:\n  {self._indent_context_data(reply_text)}\n{reply_file}")
                 elif reply_text:
-                    parts.append(f"{anchor_line}:\n{reply_text}")
+                    parts.append(f"{anchor_line}:\n  {self._indent_context_data(reply_text)}")
                 elif reply_file:
                     parts.append(f"{anchor_line}. {reply_file}")
                 else:

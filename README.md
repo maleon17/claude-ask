@@ -32,6 +32,8 @@ It runs on your Claude subscription through the official Claude Code CLI. The ba
 - **Triggers** — rules that watch a chat and react on their own (see below).
 - **Stoppable** — `.stop` ends a request that is taking too long.
 
+Chat history lines carry `OWNER` or `UNTRUSTED` trust labels assigned by the userbot from the sender's numeric ID. Display names, message text, quotes, and forwarded content cannot grant owner trust.
+
 ## Install
 
 **You need:** a Linux server with `systemd`, `git` and Python 3.10+; the [Claude Code CLI](https://claude.com/claude-code) logged in with `claude auth login --claudeai`; and a [Heroku](https://github.com/coddrago/Heroku) userbot — the installer can create one for you in Docker.
