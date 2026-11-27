@@ -67,6 +67,13 @@ from cryptography.fernet import Fernet, InvalidToken
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
 WORKDIR = os.environ.get("CLAUDE_JARVIS_WORKDIR", "/tmp")  # neutral cwd — no CLAUDE.md/memory to leak into the persona
+# Keep in sync with TRIGGER_REQUESTER_PREFIX in claude_ask.py.
+TRIGGER_REQUESTER_PREFIX = "trigger:"
+_AUTH_FAILURE_RE = re.compile(
+    r"failed to authenticate|authentication_error|oauth token (?:has )?expired"
+    r"|not logged in|please run /login|claude auth login|claude setup-token",
+    re.IGNORECASE,
+)
 # Real MCP tools (2026-08-11) replacing the ENTIRE old text-marker surface
 # (CREATE_GROUP/INVITE_TO_GROUP/RESOLVE_PERSON, then SEND_MESSAGE/SEND_FILE/
 # ADD_CONTACT/BLOCK_USER/LEAVE_CHAT/REGISTER_TRIGGER/DELETE_MESSAGES/
@@ -308,6 +315,20 @@ _TEXTS = {
                      "uk": "Порожня відповідь від Claude Code (subtype={subtype}){detail}.",
                      "kk": "Claude Code бос жауап қайтарды (subtype={subtype}){detail}.",
                      "de": "Leere Antwort von Claude Code (subtype={subtype}){detail}."},
+    "auth_expired": {
+        "en": "Claude sign-in for instance {instance_id} has expired. Sign in again as the worker user with claude auth login --claudeai.",
+        "ru": "Вход Claude для инстанса {instance_id} истёк. Войдите заново под пользователем воркера командой claude auth login --claudeai.",
+        "uk": "Вхід Claude для інстанса {instance_id} закінчився. Увійдіть знову від імені користувача воркера командою claude auth login --claudeai.",
+        "kk": "{instance_id} инстансы үшін Claude жүйесіне кіру мерзімі аяқталды. Воркер пайдаланушысы атынан claude auth login --claudeai пәрменімен қайта кіріңіз.",
+        "de": "Die Claude-Anmeldung für Instanz {instance_id} ist abgelaufen. Melden Sie sich als Worker-Benutzer mit claude auth login --claudeai erneut an.",
+    },
+    "auth_config_hint": {
+        "en": "Use this instance's CLAUDE_CONFIG_DIR.",
+        "ru": "Для этого инстанса задайте его CLAUDE_CONFIG_DIR.",
+        "uk": "Для цього інстанса задайте його CLAUDE_CONFIG_DIR.",
+        "kk": "Осы инстанстың CLAUDE_CONFIG_DIR айнымалысын орнатыңыз.",
+        "de": "Verwenden Sie CLAUDE_CONFIG_DIR dieser Instanz.",
+    },
     "no_response": {"en": "(no answer)", "ru": "(нет ответа)", "uk": "(немає відповіді)",
                     "kk": "(жауап жоқ)", "de": "(keine Antwort)"},
     "worker_error": {"en": "Worker error: {error}", "ru": "Ошибка воркера: {error}",
@@ -553,6 +574,7 @@ def run_claude_streaming(
     mcp_config: str = None, chat_id: str = None, instance_id: str = None,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
     request_id: str = None, language: str = None, persist: bool = True,
+    restrict_builtin_tools: bool = False,
 ):
     """Streams a single `claude -p` turn, calling on_progress(html_text) as
     thoughts/tool calls/results come in. Returns (final_text, thought_history,
@@ -582,6 +604,8 @@ def run_claude_streaming(
         args += ["--resume", session_id]
     if mcp_config:
         args += ["--mcp-config", mcp_config]
+    if restrict_builtin_tools:
+        args += ["--tools", ""]
     if not persist:
         # Nothing to resume later: leave no session file behind.
         args += ["--no-session-persistence"]
@@ -638,6 +662,9 @@ def run_claude_streaming(
     draft_res_blocks = []
     final_text = None
     stale_session = False
+    auth_failure = False
+    auth_error_event = False
+    normal_result = False
     thought_history = []
     new_session_id = session_id
 
@@ -680,6 +707,11 @@ def run_claude_streaming(
             except Exception:
                 continue
             t = d.get("type")
+
+            if t == "error":
+                error = d.get("error") or d.get("message") or ""
+                auth_error_event = auth_error_event or bool(_AUTH_FAILURE_RE.search(str(error)))
+                continue
 
             if t == "system" and d.get("subtype") == "init":
                 new_session_id = d.get("session_id") or new_session_id
@@ -765,6 +797,9 @@ def run_claude_streaming(
                 result_text = d.get("result") or ""
                 if result_text:
                     final_text = result_text
+                    result_is_error = bool(d.get("is_error"))
+                    normal_result = not result_is_error
+                    auth_failure = bool(result_is_error and _AUTH_FAILURE_RE.search(result_text))
                 else:
                     # An empty "result" field usually means the turn itself
                     # failed (stale --resume session id, auth/rate-limit
@@ -779,6 +814,7 @@ def run_claude_streaming(
                     # claude_ask.py's _do_ask never kicked in either.
                     subtype = d.get("subtype") or "empty_result"
                     errors = d.get("errors") or []
+                    auth_failure = any(_AUTH_FAILURE_RE.search(str(error)) for error in errors)
                     detail = "; ".join(str(e) for e in errors) if errors else ""
                     # "No conversation found with session ID" means the
                     # --resume target no longer exists on disk (session file
@@ -808,6 +844,15 @@ def run_claude_streaming(
         # Whatever the killed process managed to print is not an answer.
         raise RequestCancelled()
 
+    if auth_failure or (auth_error_event and not normal_result):
+        message = _text("auth_expired", language, instance_id=html.escape(instance_id or DEFAULT_INSTANCE))
+        if config_dir:
+            message += "\n" + _text("auth_config_hint", language)
+        hint = os.environ.get("JARVIS_LOGIN_HINT")
+        if hint is not None:
+            message += "\n" + hint
+        return "[[backend_error:claude_auth]] " + message, thought_history, None
+
     if stale_session:
         # Clear the dead session and retry once as a fresh conversation
         # instead of surfacing the error -- the caller (call_llm) persists
@@ -818,6 +863,7 @@ def run_claude_streaming(
             model=model, mcp_config=mcp_config, chat_id=chat_id, instance_id=instance_id,
             topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id,
             request_id=request_id, language=language, persist=persist,
+            restrict_builtin_tools=restrict_builtin_tools,
         )
 
     if final_text is None:
@@ -829,7 +875,7 @@ def call_llm(
     question: str, chat_id: str, mode: str, req_id: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
     owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
-    language: str = None,
+    language: str = None, restrict_builtin_tools: bool = False,
 ):
     language = _language(language)
     if mode == "chat":
@@ -871,6 +917,7 @@ def call_llm(
         mcp_config=mcp_config, chat_id=chat_id, instance_id=instance_id,
         topic_id=topic_id, exclude_id=exclude_id, requester_id=requester_id, request_id=req_id,
         language=language, persist=mode != "persona_translate",
+        restrict_builtin_tools=restrict_builtin_tools,
     )
 
     if mode == "chat" and new_session_id:
@@ -1005,7 +1052,7 @@ def _process_request(
     req_id: str, question: str, chat_id: str, mode: str, instance_id: str = DEFAULT_INSTANCE,
     topic_id: str = None, exclude_id: str = None, requester_id: str = None,
     owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
-    language: str = None,
+    language: str = None, restrict_builtin_tools: bool = False,
 ):
     result_path = os.path.join(RESULT_DIR, f"{req_id}.json")
     cancelled_result = {"done": True, "request_id": req_id, "cancelled": True, "answer": "", "thoughts": []}
@@ -1018,6 +1065,7 @@ def _process_request(
                 question, chat_id, mode, req_id, instance_id, topic_id=topic_id,
                 exclude_id=exclude_id, requester_id=requester_id, owner_authorized=owner_authorized,
                 chat_context=chat_context, session_chat_id=session_chat_id, language=language,
+                restrict_builtin_tools=restrict_builtin_tools,
             )
             print(f"  A: {answer[:80]}...", flush=True)
             _atomic_json(result_path, {"done": True, "request_id": req_id, "answer": answer, "thoughts": thoughts})
@@ -1040,17 +1088,20 @@ def _process_request_serialized(
     owner_authorized: bool = False, chat_context: str = None, session_chat_id: str = None,
     language: str = None,
 ):
+    restrict_builtin_tools = mode == "chat" and str(requester_id or "").startswith(TRIGGER_REQUESTER_PREFIX)
     # Stateless utility modes share no resumable session and stay parallel.
     if mode != "chat":
         return _process_request(
             req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
             owner_authorized, chat_context, session_chat_id, language,
+            restrict_builtin_tools=restrict_builtin_tools,
         )
     session_key_chat = session_chat_id or chat_id
     with _chat_request_lock(instance_id, session_key_chat):
         return _process_request(
             req_id, question, chat_id, mode, instance_id, topic_id, exclude_id, requester_id,
             owner_authorized, chat_context, session_chat_id, language,
+            restrict_builtin_tools=restrict_builtin_tools,
         )
 
 

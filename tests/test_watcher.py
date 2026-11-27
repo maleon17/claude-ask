@@ -46,7 +46,7 @@ def test_watcher_serializes_requests_sharing_a_session_chat_id(monkeypatch):
     release = threading.Event()
     entered = []
 
-    def process(*_args):
+    def process(*_args, **_kwargs):
         entered.append(True)
         if len(entered) == 1:
             first_started.set()
@@ -163,3 +163,130 @@ def test_abandoned_cancel_marker_is_eventually_dropped(queues):
     assert marker.exists()
     claude_watcher._scan_cancel_markers(now=time.time() + claude_watcher.CANCEL_MARKER_TTL_S + 1)
     assert not marker.exists() and "ghost" not in claude_watcher._CANCELLED
+
+
+@pytest.fixture
+def fake_claude(monkeypatch, tmp_path):
+    executable = tmp_path / "fake-claude"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLAUDE_ARGS_PATH'], 'w') as output:\n"
+        "    json.dump(sys.argv[1:], output)\n"
+        "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'new-session'}))\n"
+        "for event in json.loads(os.environ['FAKE_CLAUDE_EVENTS']):\n"
+        "    print(json.dumps(event))\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    args_path = tmp_path / "args.json"
+    saved_sessions = []
+    monkeypatch.setattr(claude_watcher, "CLAUDE_BIN", str(executable))
+    monkeypatch.setattr(claude_watcher, "load_persona", lambda *_: "persona")
+    monkeypatch.setattr(claude_watcher, "get_session_id", lambda *_: None)
+    monkeypatch.setattr(claude_watcher, "set_session_id", lambda *args: saved_sessions.append(args))
+    monkeypatch.setenv("FAKE_CLAUDE_ARGS_PATH", str(args_path))
+    monkeypatch.setenv("FAKE_CLAUDE_EVENTS", json.dumps([{"type": "result", "result": "answer", "is_error": False}]))
+    monkeypatch.delenv("JARVIS_LOGIN_HINT", raising=False)
+    return args_path, saved_sessions
+
+
+@pytest.mark.parametrize(
+    ("mode", "requester_id", "restricted"),
+    [
+        ("chat", "trigger:rule-1", True),
+        ("chat", "owner-1", False),
+        ("classify", "trigger:rule-1", False),
+    ],
+)
+def test_builtin_tools_are_disabled_only_for_trigger_turns(
+    monkeypatch, queues, fake_claude, mode, requester_id, restricted,
+):
+    args_path, _ = fake_claude
+    claude_watcher._process_request_serialized(
+        "tool-check", "question", "chat-1", mode, requester_id=requester_id,
+    )
+    args = json.loads(args_path.read_text())
+    if restricted:
+        assert args[args.index("--tools") + 1] == ""
+        assert "--mcp-config" in args
+    else:
+        assert "--tools" not in args
+    if mode == "classify":
+        assert "--mcp-config" not in args
+
+
+@pytest.mark.parametrize("language", claude_watcher.LANGUAGES)
+def test_auth_failure_is_localized_and_does_not_save_session(
+    monkeypatch, queues, fake_claude, language,
+):
+    _, saved_sessions = fake_claude
+    monkeypatch.setenv("FAKE_CLAUDE_EVENTS", json.dumps([{
+        "type": "result", "is_error": True,
+        "result": "Failed to authenticate: OAuth token has expired. Run claude auth login.",
+    }]))
+    monkeypatch.setattr(claude_watcher, "_config_dir", lambda _: "/isolated-instance")
+    answer, _ = claude_watcher.call_llm(
+        "question", "chat-1", "chat", "auth-check", instance_id="instance-2", language=language,
+    )
+    assert answer.startswith("[[backend_error:claude_auth]] ")
+    assert claude_watcher._text("auth_expired", language, instance_id="instance-2") in answer
+    assert claude_watcher._text("auth_config_hint", language) in answer
+    assert "Failed to authenticate" not in answer
+    assert saved_sessions == []
+
+
+def test_auth_failure_appends_login_hint_verbatim(monkeypatch, queues, fake_claude):
+    monkeypatch.setenv("JARVIS_LOGIN_HINT", "Login via your configured operator command")
+    monkeypatch.setenv("FAKE_CLAUDE_EVENTS", json.dumps([{
+        "type": "result", "is_error": True, "result": "authentication_error: not logged in",
+    }]))
+    answer, _ = claude_watcher.call_llm("question", "chat-1", "chat", "auth-hint")
+    assert answer.endswith("\nLogin via your configured operator command")
+    assert "CLAUDE_CONFIG_DIR" not in answer
+
+
+def test_auth_error_event_without_an_answer_is_localized(monkeypatch, queues, fake_claude):
+    _, saved_sessions = fake_claude
+    monkeypatch.setenv("FAKE_CLAUDE_EVENTS", json.dumps([{
+        "type": "error", "error": {"message": "OAuth token expired"},
+    }]))
+    answer, _ = claude_watcher.call_llm("question", "chat-1", "chat", "auth-event")
+    assert answer.startswith("[[backend_error:claude_auth]] ")
+    assert saved_sessions == []
+
+
+def test_empty_error_result_is_localized(monkeypatch, queues, fake_claude):
+    _, saved_sessions = fake_claude
+    monkeypatch.setenv("FAKE_CLAUDE_EVENTS", json.dumps([{
+        "type": "result", "is_error": True, "result": "",
+        "errors": ["Not logged in; please run /login"],
+    }]))
+    answer, _ = claude_watcher.call_llm("question", "chat-1", "chat", "auth-empty")
+    assert answer.startswith("[[backend_error:claude_auth]] ")
+    assert "Not logged in" not in answer
+    assert saved_sessions == []
+
+
+@pytest.mark.parametrize("normal_answer", [
+    "To sign in, run claude auth login --claudeai.",
+    "Failed to authenticate is the error message you asked about; run claude auth login.",
+])
+def test_normal_answer_mentioning_login_is_not_intercepted(
+    monkeypatch, queues, fake_claude, normal_answer,
+):
+    _, saved_sessions = fake_claude
+    monkeypatch.setenv("FAKE_CLAUDE_EVENTS", json.dumps([{
+        "type": "result", "is_error": False, "result": normal_answer,
+    }]))
+    answer, _ = claude_watcher.call_llm("question", "chat-1", "chat", "normal-answer")
+    assert answer == normal_answer
+    assert saved_sessions == [(claude_watcher.DEFAULT_INSTANCE, "chat-1", "new-session")]
+
+
+def test_auth_error_event_does_not_override_later_answer(monkeypatch, queues, fake_claude):
+    monkeypatch.setenv("FAKE_CLAUDE_EVENTS", json.dumps([
+        {"type": "error", "error": {"message": "not logged in"}},
+        {"type": "result", "is_error": False, "result": "The login has been restored."},
+    ]))
+    answer, _ = claude_watcher.call_llm("question", "chat-1", "chat", "auth-recovered")
+    assert answer == "The login has been restored."
