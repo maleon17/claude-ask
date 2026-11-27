@@ -1,4 +1,4 @@
-# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl and module/locales (sha256 8878933daefa);
+# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl and module/locales (sha256 612cf7f471f7);
 # change the template there and run module/build.py.
 # ClaudeAsk — .ask .search .translate + Jarvis persona, Claude Code backend
 #
@@ -3280,6 +3280,21 @@ class ClaudeAsk(loader.Module):
         """A data line can never start at column zero like a history header."""
         return re.sub(r"\r\n|[\r\n\u0085\u2028\u2029]", "\n  ", str(value))
 
+    async def _trigger_sender_field(self, message, sender):
+        """Label a trigger sender from Telegram identity, not its display name."""
+        sid = getattr(message, "sender_id", None)
+        owner_id = await self._get_owner_id()
+        is_owner = (
+            sid is not None and owner_id is not None
+            and str(sid) == str(owner_id)
+            and not getattr(getattr(message, "sender", None), "bot", False)
+        )
+        forwarded = bool(getattr(message, "fwd_from", None))
+        trust = "OWNER" if is_owner and not forwarded else "UNTRUSTED"
+        if forwarded:
+            trust += ", fwd"
+        return f"[{trust}, name={self._safe_history_name(sender)}]"
+
     @staticmethod
     def _history_media_kind(message):
         document = getattr(message, "document", None)
@@ -5242,16 +5257,18 @@ class ClaudeAsk(loader.Module):
         # The triggering message's own attachment (not a reply -- see
         # _describe_attachment's docstring for why this is needed at all).
         attachment_note = await self._describe_attachment(message)
-        attachment_part = f"\n{attachment_note}" if attachment_note else ""
+        attachment_part = f"\n  {self._indent_context_data(attachment_note)}" if attachment_note else ""
+        sender_field = await self._trigger_sender_field(message, sender)
+        trigger_text = self._indent_context_data(message.raw_text or "")
         instruction = str(trig.get("instruction") or "").strip()
         if instruction:
             question = _t("reply_agent_instructed_prompt", label=trig.get("label", trig["kind"]), chat=chat_label,
-                          sender=sender, text=(message.raw_text or ""), attachment=attachment_part,
+                          sender=sender_field, text=trigger_text, attachment=attachment_part,
                           instruction=instruction)
         else:
             question = (
-                _t("reply_agent_prompt", label=trig.get("label", trig["kind"]), chat=chat_label, sender=sender,
-                   text=(message.raw_text or ""), attachment=attachment_part)
+                _t("reply_agent_prompt", label=trig.get("label", trig["kind"]), chat=chat_label, sender=sender_field,
+                   text=trigger_text, attachment=attachment_part)
             )
         origin_chat = str(trig.get("registration_chat_id") or "").strip()
         # Explicit session override, same rule as _fire_agent_action: "here"
@@ -5467,17 +5484,18 @@ class ClaudeAsk(loader.Module):
         origin_chat = str(trig.get("registration_chat_id") or "").strip()
         urls = self._extract_urls(message)
         url_note = (
-            "\n\n" + _t("urls_agent_note", urls=", ".join(urls))
+            "\n\n  " + self._indent_context_data(_t("urls_agent_note", urls=", ".join(urls)))
             if urls else ""
         )
         # The triggering message's own attachment (not a reply -- see
         # _describe_attachment's docstring for why this is needed at all).
         attachment_note = await self._describe_attachment(message)
-        attachment_part = f"\n{attachment_note}" if attachment_note else ""
+        attachment_part = f"\n  {self._indent_context_data(attachment_note)}" if attachment_note else ""
+        sender_field = await self._trigger_sender_field(message, sender)
         prompt = (
             _t("agent_trigger_prompt", label=trig.get("label") or trig.get("kind"), chat=chat_label,
-               chat_id=message.chat_id, message_id=message.id, sender=sender,
-               text=(message.raw_text or ""), attachment=attachment_part, urls=url_note,
+               chat_id=message.chat_id, message_id=message.id, sender=sender_field,
+               text=self._indent_context_data(message.raw_text or ""), attachment=attachment_part, urls=url_note,
                instruction=instruction)
         )
         if origin_chat and origin_chat != str(message.chat_id):
